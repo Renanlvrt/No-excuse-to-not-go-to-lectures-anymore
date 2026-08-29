@@ -65,10 +65,21 @@ async def lecture_ws(ws: WebSocket):
         # live ElevenLabs Scribe session, created lazily on the first audio
         # chunk so a listener who never turns the mic on costs nothing.
         "stt": None,
+        # this machine's .env key, or one the listener pasted into the UI on a
+        # laptop that has no .env at all.
+        "api_key": ELEVENLABS_API_KEY,
     }
     force_event = asyncio.Event()
 
-    await ws.send_json({"type": "stt_status", "provider": "elevenlabs" if ELEVENLABS_API_KEY else "browser"})
+    async def send_stt_status():
+        await ws.send_json({
+            "type": "stt_status",
+            "provider": "elevenlabs",
+            "has_key": bool(state["api_key"]),
+            "from_server": bool(ELEVENLABS_API_KEY),
+        })
+
+    await send_stt_status()
 
     async def on_partial(text: str):
         await ws.send_json({"type": "partial_transcript", "text": text})
@@ -139,7 +150,7 @@ async def lecture_ws(ws: WebSocket):
                 "message": "unknown node for generate_video",
             })
             return
-        if not ELEVENLABS_API_KEY:
+        if not state["api_key"]:
             await ws.send_json({
                 "type": "error", "node_id": node["id"], "context": "generate_video",
                 "message": "No ElevenLabs API key configured.",
@@ -147,7 +158,7 @@ async def lecture_ws(ws: WebSocket):
             return
         try:
             filename, cached = await generate_video(
-                node["label"], node.get("definition", ""), ELEVENLABS_API_KEY, force=msg.get("force", False)
+                node["label"], node.get("definition", ""), state["api_key"], force=msg.get("force", False)
             )
             await ws.send_json({
                 "type": "video", "node_id": node["id"], "video_url": f"/videos/{filename}", "cached": cached,
@@ -199,13 +210,25 @@ async def lecture_ws(ws: WebSocket):
                 )
                 continue
 
+            if msg_type == "elevenlabs_key":
+                key = (msg.get("key") or "").strip()
+                if key != state["api_key"]:
+                    await stop_transcriber(commit=False)  # next chunk reopens with the new key
+                    state["api_key"] = key or ELEVENLABS_API_KEY
+                await send_stt_status()
+                continue
+
             if msg_type == "audio_chunk":
-                if not ELEVENLABS_API_KEY:
-                    continue  # frontend falls back to the browser's own recognition
+                if not state["api_key"]:
+                    await ws.send_json({
+                        "type": "error", "context": "no_key",
+                        "message": "No ElevenLabs API key on this machine - paste one to transcribe.",
+                    })
+                    continue
                 if state["stt"] is None:
                     try:
                         transcriber = RealtimeTranscriber(
-                            ELEVENLABS_API_KEY, on_partial, on_committed, on_stt_error
+                            state["api_key"], on_partial, on_committed, on_stt_error
                         )
                         await transcriber.start()
                         state["stt"] = transcriber
@@ -274,7 +297,8 @@ async def lecture_ws(ws: WebSocket):
                     force_event.set()
                 continue
 
-            # default: transcript update (browser-recognition fallback, no explicit type needed)
+            # default: bare `{text}` transcript update, for scripts/tests that
+            # push a transcript straight in without going through the mic
             state["transcript"] = msg.get("text", state["transcript"])
             if msg.get("force"):
                 force_event.set()

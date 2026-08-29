@@ -29,9 +29,14 @@ app's own websocket to the backend, which relays it to ElevenLabs' realtime
 STT websocket (`scribe_v2_realtime`, VAD commit strategy) — so the API key
 never reaches the browser. `partial_transcript` events render as live
 interim text; `committed_transcript` events append to the server-side
-transcript that feeds the Gemini extraction loop. If `ELEVENLABS_API_KEY`
-is unset the backend announces `provider: browser` on connect and the
-frontend falls back to the Web Speech API exactly as before.
+transcript that feeds the Gemini extraction loop.
+
+This is the *only* transcription path — the browser's own Web Speech API is
+never used, so every laptop gets the same accuracy. On a machine with no
+`ELEVENLABS_API_KEY` in `.env`, the backend reports `has_key: false` and the
+UI shows a key box: paste a key there and it's kept in that browser's
+`localStorage`, sent to *this* backend on every (re)connect, and used for
+that connection only. Nothing to install on a friend's laptop beyond the app.
 
 ## How a concept becomes a card
 1. The transcript is sent to Gemini along with the concept map already built
@@ -52,13 +57,11 @@ See `SUCCESS_CRITERIA.md` for the full, itemized, automated-verification
 checklist (10/10 core categories, all driven through the real running app
 with Playwright, not just eyeballed). Two honest gaps:
 
-- **Browser SpeechRecognition transcribing real speech**: can't be verified
-  headlessly (a fresh automated Chrome profile has no on-device recognition
-  model, and cloud recognition behaves differently under automation). Real
-  audio reaching the browser *was* verified directly (measured signal via
-  getUserMedia) — this is the same tech as everyday Chrome dictation and
-  should just work when you talk into it; the manual text box is the
-  proven fallback if it doesn't.
+- **Live mic → ElevenLabs with a real speaker**: the full backend path was
+  verified with synthesized audio (partial → committed → transcript), and
+  real audio reaching the browser was verified directly (measured signal via
+  getUserMedia), but nobody has spoken into it under automation. The manual
+  text box is the proven fallback if it misbehaves.
 - **A successful on-demand image render**: the mechanism (single call per
   click, never automatic, graceful failure with per-card recovery) is fully
   verified — including a real bug found and fixed where a failed request
@@ -101,7 +104,7 @@ uvicorn backend.main:app --port 8010
 ## Sponsors (RUN/HACK, London, Aug 29 2026)
 - **Google Gemini** — the actual LLM in use, powers everything
 - **ElevenLabs** — Scribe v2 realtime is now the transcription engine
-  (`backend/services/transcribe.py`); Web Speech API is only the fallback.
+  (`backend/services/transcribe.py`); the browser's Web Speech API is unused.
 - Tavily — no working API key; not wired in.
 - ⚠️ RUN/HACK's official sponsor list wasn't published as of building this —
   ElevenLabs/Tavily were guesses based on the hackathon name pattern, not

@@ -21,6 +21,13 @@
     <button id="quizBtn">📝 Quiz me</button>
   </div>
   <p id="status">idle</p>
+  <div id="keyBox" class="key-box" hidden>
+    <label for="keyInput">This laptop has no ElevenLabs key in <code>.env</code> — paste one to transcribe (stored in this browser only):</label>
+    <div class="key-row">
+      <input id="keyInput" type="password" placeholder="sk_..." autocomplete="off" spellcheck="false">
+      <button id="keySaveBtn">Use key</button>
+    </div>
+  </div>
   <div id="collapsibles">
     <div class="panel-box">
       <label>Live transcript</label>

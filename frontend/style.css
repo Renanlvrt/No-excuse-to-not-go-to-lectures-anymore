@@ -66,6 +66,18 @@ button:disabled { opacity: 0.5; cursor: default; }
   resize: vertical; background: var(--panel); color: var(--text);
 }
 
+.key-box {
+  border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.6rem;
+  background: var(--bg); font-size: 0.78rem; margin-bottom: 0.4rem;
+}
+.key-box label { display: block; color: var(--muted); margin-bottom: 0.25rem; font-size: 0.72rem; }
+.key-row { display: flex; gap: 0.4rem; }
+.key-row input {
+  flex: 1; max-width: 380px; font-family: inherit; font-size: 0.78rem;
+  border-radius: 6px; border: 1px solid var(--border); padding: 0.3rem 0.5rem;
+  background: var(--panel); color: var(--text);
+}
+
 /* ---------- layout: canvas (left) + panel (right) ---------- */
 :root { --panel-width: 500px; }
 #main { flex: 1; min-height: 0; display: flex; position: relative; }
