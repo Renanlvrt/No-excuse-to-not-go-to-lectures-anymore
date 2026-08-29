@@ -16,6 +16,9 @@ from backend.services.widgetgen import generate_widget
 from backend.services.videogen import generate_video, NeedsProPlanError, VIDEO_DIR
 from backend.services.quizgen import generate_quiz, generate_check_question
 from backend.services.summarygen import generate_summary
+from backend.services.explain import explain_deep
+from backend.services.intent import match_level_intent
+from backend.services.tts import speak_level, AUDIO_DIR
 from backend.services.transcribe import RealtimeTranscriber
 
 ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
@@ -25,7 +28,13 @@ app = FastAPI()
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR, html=True), name="static")
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
+app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
+FIRST_EXTRACTION_SECONDS = 3  # while the map is still empty, poll this often so
+# the first cards are on screen inside the first ~10s of a demo instead of at
+# the end of the first full 20s cycle.
+FIRST_EXTRACTION_MIN_CHARS = 120  # ...but only once there's actually a couple of
+# sentences to extract from, otherwise the first call burns quota on "So,".
 EXTRACTION_INTERVAL_SECONDS = 20  # ~3 calls/min: stays well under Gemini free-tier's
 # ~10 RPM cap, and under a ~2hr live lecture keeps total calls within the free
 # tier's daily request budget (reportedly as low as ~250/day for flash models
@@ -47,6 +56,10 @@ async def lecture_ws(ws: WebSocket):
     await ws.accept()
     state = {
         "transcript": "",  # speech, owned by the server when ElevenLabs is transcribing
+        # the segment ElevenLabs hasn't committed yet. It still feeds
+        # extraction: waiting for the commit is what used to make the map lag
+        # a whole sentence behind the lecturer.
+        "partial": "",
         "manual": "",      # whatever is typed/pasted in the frontend's text box
         "last_extracted": "",
         "graph": {"nodes": [], "edges": []},
@@ -68,6 +81,9 @@ async def lecture_ws(ws: WebSocket):
         # this machine's .env key, or one the listener pasted into the UI on a
         # laptop that has no .env at all.
         "api_key": ELEVENLABS_API_KEY,
+        # the card the student is looking at - the target of spoken level
+        # commands ("explain that simpler").
+        "selected_node_id": None,
     }
     force_event = asyncio.Event()
 
@@ -82,11 +98,23 @@ async def lecture_ws(ws: WebSocket):
     await send_stt_status()
 
     async def on_partial(text: str):
+        state["partial"] = text or ""
         await ws.send_json({"type": "partial_transcript", "text": text})
 
     async def on_committed(text: str):
+        # the segment always goes into the transcript first, command or not:
+        # a trigger phrase must never silently disappear from what feeds
+        # concept extraction.
         state["transcript"] = (state["transcript"] + " " + text).strip()
+        state["partial"] = ""
         await ws.send_json({"type": "transcript", "text": state["transcript"], "committed": text})
+
+        level = match_level_intent(text)
+        if level and state["selected_node_id"]:
+            await ws.send_json({
+                "type": "level_intent", "node_id": state["selected_node_id"],
+                "level": level, "phrase": text.strip(),
+            })
 
     async def on_stt_error(message: str):
         await ws.send_json({"type": "error", "context": "transcribe", "message": message})
@@ -106,6 +134,14 @@ async def lecture_ws(ws: WebSocket):
         except Exception:
             pass
         await transcriber.close()
+
+    def store_deep(node: dict, result: tuple[str, bool]) -> dict:
+        """Kept on the node itself so extract_flowchart's merge (which re-emits
+        an existing node verbatim) carries the level-3 text forward instead of
+        dropping it on the next extraction cycle."""
+        text, cached = result
+        node["deep"] = text
+        return {"type": "deep", "node_id": node["id"], "text": text, "cached": cached}
 
     async def handle_node_action(msg: dict, context: str, run, ok_payload):
         """Shared per-node action pattern (ask / generate_image /
@@ -174,6 +210,40 @@ async def lecture_ws(ws: WebSocket):
                 "message": f"video generation failed: {str(e)[:200]}",
             })
 
+    async def handle_speak_level(msg: dict):
+        """Like video, this runs as its own task on real async I/O rather than
+        blocking the loop - the lecture keeps being transcribed and extracted
+        while a level is being voiced. The text is taken from the node
+        server-side, so the browser never needs the API key."""
+        level = int(msg.get("level") or 2)
+        node = _find_node(state["graph"], msg.get("node_id"))
+        if not node:
+            await ws.send_json({
+                "type": "error", "node_id": msg.get("node_id"), "context": "speak_level",
+                "message": "unknown node for speak_level",
+            })
+            return
+        text = {1: node.get("analogy"), 3: node.get("deep")}.get(level) or node.get("definition") or node["label"]
+        if not state["api_key"]:
+            await ws.send_json({
+                "type": "error", "node_id": node["id"], "context": "speak_level",
+                "message": "No ElevenLabs API key configured.",
+            })
+            return
+        try:
+            filename, cached = await speak_level(
+                node["label"], level, text, state["api_key"], force=msg.get("force", False)
+            )
+            await ws.send_json({
+                "type": "audio", "node_id": node["id"], "level": level,
+                "audio_url": f"/audio/{filename}", "cached": cached,
+            })
+        except Exception as e:
+            await ws.send_json({
+                "type": "error", "node_id": node["id"], "context": "speak_level",
+                "message": f"speech generation failed: {str(e)[:200]}",
+            })
+
     async def receive_loop():
         while True:
             msg = await ws.receive_json()
@@ -198,6 +268,22 @@ async def lecture_ws(ws: WebSocket):
                         "type": "image", "node_id": node["id"], "image_base64": result[0], "cached": result[1],
                     },
                 )
+                continue
+
+            if msg_type == "explain_deep":
+                await handle_node_action(
+                    msg, "explain_deep",
+                    run=lambda node: explain_deep(node["label"], node.get("definition", ""), force=msg.get("force", False)),
+                    ok_payload=store_deep,
+                )
+                continue
+
+            if msg_type == "select_node":
+                state["selected_node_id"] = msg.get("node_id")
+                continue
+
+            if msg_type == "speak_level":
+                asyncio.create_task(handle_speak_level(msg))
                 continue
 
             if msg_type == "generate_widget":
@@ -321,16 +407,28 @@ async def lecture_ws(ws: WebSocket):
     async def extraction_loop():
         backoff_skips_remaining = 0
         while True:
+            # An empty map is the one moment where latency is worth an extra
+            # call: poll fast until the first cards exist, then settle into the
+            # quota-friendly 20s cadence.
+            first_pass = not state["graph"].get("nodes")
+            interval = FIRST_EXTRACTION_SECONDS if first_pass else EXTRACTION_INTERVAL_SECONDS
             forced = False
             try:
-                await asyncio.wait_for(force_event.wait(), timeout=EXTRACTION_INTERVAL_SECONDS)
+                await asyncio.wait_for(force_event.wait(), timeout=interval)
                 forced = True
             except asyncio.TimeoutError:
                 pass
             force_event.clear()
 
-            transcript = (state["transcript"] + " " + state["manual"]).strip()
+            # the uncommitted tail counts: the student is mid-sentence and the
+            # map should already be reacting to it.
+            transcript = " ".join(
+                p for p in (state["transcript"], state["partial"], state["manual"]) if p
+            ).strip()
             if not transcript:
+                continue
+
+            if first_pass and not forced and len(transcript) < FIRST_EXTRACTION_MIN_CHARS:
                 continue
 
             if state["busy"] and not forced:

@@ -31,6 +31,7 @@ const simOverlayBox = document.querySelector(".sim-overlay-box");
 const simOverlayTitle = document.getElementById("simOverlayTitle");
 const simOverlayClose = document.getElementById("simOverlayClose");
 
+const levelSelect = document.getElementById("levelSelect");
 const keyBox = document.getElementById("keyBox");
 const keyInput = document.getElementById("keyInput");
 const keySaveBtn = document.getElementById("keySaveBtn");
@@ -43,6 +44,11 @@ let wsConnected = false;    // websocket state - INDEPENDENT of listening now,
 let reconnectDelay = 1000;
 let selectedNodeId = null;
 let hasKey = false;          // set by the backend's stt_status message
+// Three comprehension levels per concept, all read from text already in
+// memory: 1 = analogy (intuition), 2 = definition (mechanism), 3 = the
+// generated exam-level text. Switching levels NEVER triggers a request -
+// only the Rigour tab's explicit button does, once per concept ever.
+let globalLevel = 2;
 let partialTranscript = "";  // ElevenLabs interim text, replaced as it firms up
 let audioStream = null, audioContext = null, audioNode = null, audioSource = null;
 
@@ -309,6 +315,8 @@ function mergeGraph(data) {
   const newlyAdded = [];
   for (const n of data.nodes || []) {
     if (nodeState[n.id]) {
+      // whitelist: anything generated client-side (deep text, image, qa...)
+      // must NOT be listed here or an extraction cycle would wipe it.
       Object.assign(nodeState[n.id], {
         label: n.label, definition: n.definition, analogy: n.analogy, category: n.category,
         mode: n.mode, steps: n.steps || [],
@@ -328,6 +336,8 @@ function mergeGraph(data) {
           // double-fire a duplicate request for the same node.
           widgetPending: false, imagePending: false, askPending: false,
           videoPending: false, videoUrl: null,
+          deep: null, deepPending: false, level: null, // level: per-node override of globalLevel
+          audioUrls: {}, audioPending: false, // per-level TTS, keyed 1/2/3
           checkPending: false, checkQuestion: null, checkAnswered: false,
         },
         n, { steps: n.steps || [] }
@@ -416,6 +426,24 @@ function renderAllCards() {
     if (!cardEls[id]) createCard(node);
     else applyCardSizing(cardEls[id], node);
   }
+  refreshCardBacks();
+}
+
+// A card's back face shows the current level's text. Level 3 falls back to
+// the definition for any node whose deep text hasn't been generated - the
+// global switch is a pure in-memory re-render, it never fetches anything.
+function levelText(node, level) {
+  if (level === 1) return node.analogy || node.definition || node.label;
+  if (level === 3) return node.deep || node.definition || node.label;
+  return node.definition || node.label;
+}
+
+function refreshCardBacks() {
+  for (const id in cardEls) {
+    const node = nodeState[id];
+    const def = cardEls[id].querySelector(".card-definition");
+    if (node && def) def.textContent = levelText(node, globalLevel);
+  }
 }
 
 function createCard(node) {
@@ -455,7 +483,7 @@ function createCard(node) {
   back.style.setProperty("--card-color", catStyle.color);
   const def = document.createElement("div");
   def.className = "card-definition";
-  def.textContent = node.definition || node.label;
+  def.textContent = levelText(node, globalLevel);
   back.appendChild(def);
 
   inner.appendChild(front);
@@ -475,6 +503,9 @@ function createCard(node) {
 // ---------- right panel: the real interaction surface for one selected node ----------
 function selectNode(nodeId) {
   selectedNodeId = nodeId;
+  // the server needs to know which card a spoken "explain that simpler"
+  // refers to.
+  if (wsReady()) ws.send(JSON.stringify({ type: "select_node", node_id: nodeId }));
   for (const id in cardEls) cardEls[id].classList.toggle("selected", id === nodeId);
   renderPanel();
 }
@@ -502,17 +533,7 @@ function renderPanel() {
   title.textContent = node.label;
   panelEl.appendChild(title);
 
-  if (node.analogy) {
-    const analogy = document.createElement("p");
-    analogy.className = "panel-analogy";
-    analogy.textContent = "💡 " + node.analogy;
-    panelEl.appendChild(analogy);
-  }
-
-  const def = document.createElement("p");
-  def.className = "panel-definition";
-  def.textContent = node.definition || "";
-  panelEl.appendChild(def);
+  renderLevelSection(node);
 
   if (node.lastError) {
     const err = document.createElement("div");
@@ -526,6 +547,110 @@ function renderPanel() {
   renderVideoSection(node);
   renderImageSection(node);
   renderQaSection(node);
+}
+
+// ---------- three comprehension levels ----------
+// L1 and L2 are text the node already carries (analogy / definition), so
+// switching between them is free. L3 is generated once per concept, on an
+// explicit click, and cached server-side forever after.
+const LEVELS = [
+  { n: 1, name: "Intuition", hint: "What is this like?" },
+  { n: 2, name: "Mechanism", hint: "How does it actually work?" },
+  { n: 3, name: "Rigour", hint: "What would a professor grill you on?" },
+];
+
+function renderLevelSection(node) {
+  const level = node.level || globalLevel;
+
+  const tabs = document.createElement("div");
+  tabs.className = "level-tabs";
+  for (const l of LEVELS) {
+    const tab = document.createElement("button");
+    tab.className = "level-tab" + (l.n === level ? " active" : "");
+    tab.textContent = l.name;
+    tab.title = l.hint;
+    tab.addEventListener("click", () => {
+      node.level = l.n; // remembered per node, so coming back keeps this level
+      renderPanel();
+    });
+    tabs.appendChild(tab);
+  }
+  panelEl.appendChild(tabs);
+
+  const body = document.createElement("p");
+  body.className = "panel-definition";
+  panelEl.appendChild(body);
+
+  renderSpeakButton(node, level);
+
+  if (level === 1) {
+    body.textContent = node.analogy || "No analogy for this concept — try Mechanism.";
+    return;
+  }
+  if (level === 2) {
+    body.textContent = node.definition || "";
+    return;
+  }
+
+  if (node.deep) {
+    body.textContent = node.deep;
+    return;
+  }
+  body.textContent = node.definition || "";
+  const btn = document.createElement("button");
+  if (node.deepPending) {
+    btn.textContent = "Generating…";
+    btn.disabled = true;
+  } else {
+    btn.textContent = "🎓 Go deeper";
+    btn.addEventListener("click", () => requestDeep(node));
+  }
+  panelEl.appendChild(btn);
+}
+
+// One voice per level (warm/slow, neutral, fast/dense) so the sound says
+// which level you're on. Synthesis is cached per (concept, level) on the
+// server, so replaying costs zero characters of the TTS quota.
+function renderSpeakButton(node, level) {
+  const url = (node.audioUrls || {})[level];
+  if (url) {
+    const audio = document.createElement("audio");
+    audio.src = url;
+    audio.controls = true;
+    audio.autoplay = node.audioAutoplay === level; // only the freshly returned one
+    node.audioAutoplay = null;
+    audio.className = "level-audio";
+    panelEl.appendChild(audio);
+    return;
+  }
+  const btn = document.createElement("button");
+  btn.className = "speak-btn";
+  if (node.audioPending) {
+    btn.textContent = "Voicing…";
+    btn.disabled = true;
+  } else {
+    btn.textContent = "🔊 Read it to me";
+    btn.addEventListener("click", () => requestSpeak(node, level));
+  }
+  panelEl.appendChild(btn);
+}
+
+function requestSpeak(node, level) {
+  if (node.audioPending) return;
+  if (!wsReady()) return;
+  node.lastError = null;
+  node.audioPending = true;
+  ws.send(JSON.stringify({ type: "speak_level", node_id: node.id, level }));
+  if (selectedNodeId === node.id) renderPanel();
+}
+
+function requestDeep(node) {
+  if (node.deepPending) return;
+  if (!wsReady()) return;
+  node.lastError = null;
+  node.deepPending = true;
+  ws.send(JSON.stringify({ type: "explain_deep", node_id: node.id }));
+  if (selectedNodeId === node.id) renderPanel();
 }
 
 // ---------- teaching video (ElevenLabs - needs a Pro-tier key; wired and
@@ -981,6 +1106,15 @@ keySaveBtn.onclick = () => {
 };
 keyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") keySaveBtn.click(); });
 
+// Purely a re-render of text already in memory: flipping the whole map to
+// another level costs exactly zero API calls, however many nodes there are.
+levelSelect.addEventListener("change", () => {
+  globalLevel = Number(levelSelect.value);
+  for (const id in nodeState) nodeState[id].level = null; // global choice wins over per-node ones
+  refreshCardBacks();
+  renderPanel();
+});
+
 manualInput.addEventListener("input", () => {
   if (!wsReady()) return;
   sendManualText();
@@ -994,8 +1128,20 @@ function sendManualText(force = false) {
   ws.send(JSON.stringify({ type: "manual_text", text: manualInput.value, force }));
 }
 
+// The uncommitted tail is shown greyed-out with a caret, so you can see the
+// words arriving live (they already feed extraction server-side) and see the
+// moment ElevenLabs firms them up.
 function renderTranscript() {
-  transcriptEl.textContent = (fullTranscript + (partialTranscript ? " " + partialTranscript : "")).trim();
+  transcriptEl.textContent = "";
+  const committed = document.createElement("span");
+  committed.textContent = fullTranscript;
+  transcriptEl.appendChild(committed);
+  if (partialTranscript) {
+    const partial = document.createElement("span");
+    partial.className = "transcript-partial";
+    partial.textContent = (fullTranscript ? " " : "") + partialTranscript;
+    transcriptEl.appendChild(partial);
+  }
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
@@ -1041,6 +1187,8 @@ function connect() {
           : "Video generation failed - try again later.",
         ask: "That didn't go through - try asking again.",
         generate_check: "Couldn't generate a check question - try again.",
+        explain_deep: "Couldn't generate the rigorous version - try again.",
+        speak_level: "Couldn't read that out loud - try again.",
         generate_quiz: "Couldn't generate the quiz - try again.",
         generate_summary: "Couldn't generate the wrap-up summary - try again.",
         transcribe: "ElevenLabs transcription dropped - press Stop then Start to reconnect, or use the text box below.",
@@ -1063,6 +1211,8 @@ function connect() {
         if (msg.context === "generate_video") node.videoPending = false;
         if (msg.context === "ask") node.askPending = false;
         if (msg.context === "generate_check") node.checkPending = false;
+        if (msg.context === "explain_deep") node.deepPending = false;
+        if (msg.context === "speak_level") node.audioPending = false;
         if (selectedNodeId === msg.node_id) renderPanel();
       }
 
@@ -1096,6 +1246,35 @@ function connect() {
       if (node) {
         node.qa.push({ question: msg.question, answer: msg.answer });
         node.askPending = false;
+        if (selectedNodeId === msg.node_id) renderPanel();
+      }
+    } else if (msg.type === "audio") {
+      const node = nodeState[msg.node_id];
+      if (node) {
+        if (!node.audioUrls) node.audioUrls = {};
+        node.audioUrls[msg.level] = msg.audio_url;
+        node.audioPending = false;
+        node.audioAutoplay = msg.level;
+        if (selectedNodeId === msg.node_id) renderPanel();
+      }
+    } else if (msg.type === "level_intent") {
+      // spoken command ("explain that simpler") matched server-side by a
+      // local regex - no LLM call, so it lands instantly.
+      const node = nodeState[msg.node_id];
+      if (node) {
+        node.level = msg.level;
+        setStatus(`🎙 "${msg.phrase}" → level ${msg.level}`, "ok");
+        if (selectedNodeId === msg.node_id) renderPanel();
+        if (msg.level === 3 && !node.deep) requestDeep(node);
+      }
+    } else if (msg.type === "deep") {
+      const node = nodeState[msg.node_id];
+      if (node) {
+        node.deep = msg.text;
+        node.deepPending = false;
+        node.level = 3;
+        if (msg.cached) setStatus("⚡ instant - seen this concept before", "ok");
+        refreshCardBacks();
         if (selectedNodeId === msg.node_id) renderPanel();
       }
     } else if (msg.type === "image") {
