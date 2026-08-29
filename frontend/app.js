@@ -1194,10 +1194,19 @@ function sendManualText(force = false) {
 // The uncommitted tail is shown greyed-out with a caret, so you can see the
 // words arriving live (they already feed extraction server-side) and see the
 // moment ElevenLabs firms them up.
+// Only the visible tail is rendered: a full lecture's transcript in one text
+// node makes every partial (several a second) re-layout the whole panel. The
+// complete text still lives in `fullTranscript` and server-side.
+const TRANSCRIPT_RENDER_CHARS = 4000;
+
 function renderTranscript() {
+  // don't fight someone who scrolled back to re-read something
+  const atBottom = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 24;
   transcriptEl.textContent = "";
   const committed = document.createElement("span");
-  committed.textContent = fullTranscript;
+  committed.textContent = fullTranscript.length > TRANSCRIPT_RENDER_CHARS
+    ? "… " + fullTranscript.slice(-TRANSCRIPT_RENDER_CHARS)
+    : fullTranscript;
   transcriptEl.appendChild(committed);
   if (partialTranscript) {
     const partial = document.createElement("span");
@@ -1205,7 +1214,7 @@ function renderTranscript() {
     partial.textContent = (fullTranscript ? " " : "") + partialTranscript;
     transcriptEl.appendChild(partial);
   }
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  if (atBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
 function connect() {
@@ -1232,9 +1241,11 @@ function connect() {
       partialTranscript = msg.text || "";
       renderTranscript();
     } else if (msg.type === "transcript") {
-      // server-side (ElevenLabs) transcript is authoritative - it already
-      // holds every committed segment, so mirror it rather than appending.
-      fullTranscript = msg.text || "";
+      // append the one new final rather than mirroring the server's copy: a
+      // reconnect gives the server a fresh empty transcript, and mirroring it
+      // would wipe everything said before the socket dropped.
+      if (msg.committed) fullTranscript = (fullTranscript + " " + msg.committed).trim();
+      else fullTranscript = msg.text || "";
       partialTranscript = "";
       renderTranscript();
     } else if (msg.type === "diagram") {

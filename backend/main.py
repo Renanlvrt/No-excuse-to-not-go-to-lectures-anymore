@@ -98,6 +98,16 @@ async def lecture_ws(ws: WebSocket):
         "selected_node_id": None,
     }
     force_event = asyncio.Event()
+    last_partial_trace = 0.0
+
+    def trace_partial(text: str) -> None:
+        """One line per ~2s: a partial arrives several times a second and the
+        log has to stay readable next to the extraction traces."""
+        nonlocal last_partial_trace
+        now = time.monotonic()
+        if now - last_partial_trace >= 2.0:
+            last_partial_trace = now
+            print(f"[TRACE] partial forwarded ({len(text)} chars)", flush=True)
 
     async def send_stt_status():
         await ws.send_json({
@@ -110,8 +120,15 @@ async def lecture_ws(ws: WebSocket):
     await send_stt_status()
 
     async def on_partial(text: str):
+        # display path: straight to the browser, no timer, no batching. It
+        # also feeds extraction as the uncommitted tail (state["partial"]),
+        # which is replaced wholesale each time - a partial is a revision,
+        # so it never accumulates in the buffer.
         state["partial"] = text or ""
-        await ws.send_json({"type": "partial_transcript", "text": text})
+        trace_partial(state["partial"])
+        await ws.send_json({
+            "type": "partial_transcript", "text": text, "final": False,
+        })
 
     async def on_committed(text: str):
         # the segment always goes into the transcript first, command or not:
@@ -119,7 +136,11 @@ async def lecture_ws(ws: WebSocket):
         # concept extraction.
         state["transcript"] = (state["transcript"] + " " + text).strip()
         state["partial"] = ""
-        await ws.send_json({"type": "transcript", "text": state["transcript"], "committed": text})
+        print(f"[TRACE] final appended to buffer ({len(text)} chars)", flush=True)
+        await ws.send_json({
+            "type": "transcript", "text": state["transcript"],
+            "committed": text, "final": True,
+        })
 
         level = match_level_intent(text)
         if level and state["selected_node_id"]:
@@ -399,7 +420,7 @@ async def lecture_ws(ws: WebSocket):
             if msg_type == "speech_partial":
                 # interim words feed extraction immediately instead of waiting
                 # for Chrome to finalise the sentence.
-                state["partial"] = msg.get("text") or ""
+                await on_partial(msg.get("text") or "")
                 continue
 
             if msg_type == "manual_text":

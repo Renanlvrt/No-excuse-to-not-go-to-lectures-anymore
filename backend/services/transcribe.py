@@ -89,6 +89,7 @@ class RealtimeTranscriber:
             async for raw in self._ws:
                 msg = json.loads(raw)
                 kind = msg.get("message_type")
+                print(f"[TRACE] scribe event: {kind}", flush=True)
                 if kind == "partial_transcript":
                     await self._on_partial(msg.get("text", ""))
                 elif kind == "committed_transcript":
