@@ -18,11 +18,12 @@ Open `http://localhost:8010/static/index.html` in **Chrome**.
 Needs a `.env` file (copy `.env.example`, fill in real keys — ask the
 team, never invent placeholder keys and never commit real ones).
 
-## Transcription: ElevenLabs Scribe realtime
-Mic audio is streamed browser → our websocket → ElevenLabs
-`scribe_v2_realtime` (`backend/services/transcribe.py`). Needs
-`ELEVENLABS_API_KEY`. It's the only transcription path (the browser's Web
-Speech API is never used) — on a laptop with no `.env` key the UI shows a
+## Transcription: Chrome Web Speech first, ElevenLabs Scribe as fallback
+The **mic** goes through Chrome's on-device Web Speech API, which sends
+`speech_partial` / `speech_segment` over our websocket (commit `9fdb161`).
+ElevenLabs `scribe_v2_realtime` (`backend/services/transcribe.py`, needs
+`ELEVENLABS_API_KEY`) handles the **🔊 Listen to a tab** button and any
+browser without Web Speech — on a laptop with no `.env` key the UI shows a
 box to paste one, kept in that browser's localStorage.
 
 ## Three comprehension levels per concept

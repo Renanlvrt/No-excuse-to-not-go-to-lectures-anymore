@@ -28,7 +28,9 @@ Marked timings are cumulative. Read at ~150 wpm. Total ≈ 82s.
 > to *you*, mid-lecture, while the lecture is still changeable.
 >
 > **[0:26–0:48] What it is**
-> Speak — or let the lecturer speak — and ElevenLabs Scribe streams the room
+> Speak — or let the lecturer speak — and the room is transcribed live, on
+> device in the browser, with ElevenLabs Scribe taking over for tab audio or
+> any browser without speech recognition. It streams
 > into a semantic knowledge map that grows as the concepts arrive: a radial
 > hierarchy, not a wall of text. Every concept exists at three comprehension
 > levels at once. Level one, Intuition: what is this like? Level two,
@@ -317,7 +319,8 @@ Ranked by how likely they are to bite you.
    **Rehearse the exact phrases that are in the pattern list** — "explain
    that simpler", "go deeper", "how does that actually work", "back to
    normal" all match; improvised paraphrases may not. It also only fires
-   on a *committed* Scribe segment, so there's a second or two of lag.
+   on a *final* speech segment (Chrome's on-device recogniser, or a committed
+   Scribe segment when Scribe is the path), so there's a second or two of lag.
    Have the click-the-tab fallback rehearsed; do not retry the phrase.
    (This change landed after the pitch was drafted and has not been
    exercised through real speech — verify it with the mic before stage.)
@@ -327,8 +330,9 @@ Ranked by how likely they are to bite you.
    path. Pre-warm everything cacheable; have the recorded clip ready.
 4. **Nobody has confirmed a full end-to-end run with a real human speaking
    into a real mic since the last three features landed.** `HANDOVER.md`
-   ranks this as priority #1 and it was still open at 16:15. Live mic →
-   Scribe was verified with *synthesized* audio only. This is the single
+   ranks this as priority #1 and it was still open at 16:15. The mic path
+   (Chrome Web Speech) has never been exercised on this hardware; the Scribe
+   fallback was verified with *synthesized* audio only. This is the single
    biggest demo risk on the list, and it is fixable in the next hour by
    somebody just doing it.
 5. **The empty-map extraction loop still polls every 3s off a mutating
