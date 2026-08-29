@@ -33,6 +33,13 @@ re-renders — zero API calls. L3 is generated on an explicit click only,
 cached by concept slug (`data/deep_cache.json`) and stored on the node so
 extraction merges keep it.
 
+Voice drives it too: committed Scribe segments run through a local regex
+(`backend/services/intent.py`, no LLM call) — a short aside like "explain
+that simpler" switches the selected card's level. The panel can also read
+the current level out loud with a different ElevenLabs voice per level
+(`backend/services/tts.py`), cached to `data/audio/` by (concept, level)
+and served from `/audio`.
+
 ## Current LLM provider: Gemini (temporary)
 `GEMINI_API_KEY` powers concept extraction now. This is a **deliberate
 short-term choice** — the plan is to move off Gemini later (possibly to
