@@ -168,6 +168,19 @@ button:disabled { opacity: 0.5; cursor: default; }
   padding: 0.55rem 0.8rem; border-radius: 0 8px 8px 0; margin: 0 0 0.8rem;
 }
 .panel-definition { font-size: 0.95rem; line-height: 1.45; color: var(--text); margin: 0 0 0.8rem; }
+.level-select { font-size: 0.78rem; color: var(--muted); display: flex; align-items: center; gap: 0.3rem; }
+.level-select select {
+  font-family: inherit; font-size: 0.78rem; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+  padding: 0.25rem 0.35rem;
+}
+.level-tabs { display: flex; gap: 0.3rem; margin: 0 0 0.7rem; }
+.level-tab {
+  flex: 1; font-size: 0.78rem; padding: 0.3rem 0.4rem; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--muted); cursor: pointer;
+}
+.level-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
 .panel-section { margin: 1.1rem 0; padding-top: 1.1rem; border-top: 1px solid var(--border); }
 .panel-section h3 { margin: 0 0 0.5rem; font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
 

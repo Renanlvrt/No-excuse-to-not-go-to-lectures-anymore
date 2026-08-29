@@ -16,6 +16,7 @@ from backend.services.widgetgen import generate_widget
 from backend.services.videogen import generate_video, NeedsProPlanError, VIDEO_DIR
 from backend.services.quizgen import generate_quiz, generate_check_question
 from backend.services.summarygen import generate_summary
+from backend.services.explain import explain_deep
 from backend.services.transcribe import RealtimeTranscriber
 
 ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
@@ -107,6 +108,14 @@ async def lecture_ws(ws: WebSocket):
             pass
         await transcriber.close()
 
+    def store_deep(node: dict, result: tuple[str, bool]) -> dict:
+        """Kept on the node itself so extract_flowchart's merge (which re-emits
+        an existing node verbatim) carries the level-3 text forward instead of
+        dropping it on the next extraction cycle."""
+        text, cached = result
+        node["deep"] = text
+        return {"type": "deep", "node_id": node["id"], "text": text, "cached": cached}
+
     async def handle_node_action(msg: dict, context: str, run, ok_payload):
         """Shared per-node action pattern (ask / generate_image /
         generate_widget): look up the node, run the (blocking) call, reply
@@ -197,6 +206,14 @@ async def lecture_ws(ws: WebSocket):
                     ok_payload=lambda node, result: {
                         "type": "image", "node_id": node["id"], "image_base64": result[0], "cached": result[1],
                     },
+                )
+                continue
+
+            if msg_type == "explain_deep":
+                await handle_node_action(
+                    msg, "explain_deep",
+                    run=lambda node: explain_deep(node["label"], node.get("definition", ""), force=msg.get("force", False)),
+                    ok_payload=store_deep,
                 )
                 continue
 

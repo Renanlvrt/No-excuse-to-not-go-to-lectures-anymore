@@ -25,6 +25,14 @@ Mic audio is streamed browser → our websocket → ElevenLabs
 Speech API is never used) — on a laptop with no `.env` key the UI shows a
 box to paste one, kept in that browser's localStorage.
 
+## Three comprehension levels per concept
+Every card reads at L1 Intuition (the node's `analogy`), L2 Mechanism (its
+`definition`) and L3 Rigour (`backend/services/explain.py`, the only one
+generated). L1/L2 and the topbar "whole map" selector are pure in-memory
+re-renders — zero API calls. L3 is generated on an explicit click only,
+cached by concept slug (`data/deep_cache.json`) and stored on the node so
+extraction merges keep it.
+
 ## Current LLM provider: Gemini (temporary)
 `GEMINI_API_KEY` powers concept extraction now. This is a **deliberate
 short-term choice** — the plan is to move off Gemini later (possibly to
