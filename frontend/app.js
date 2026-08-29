@@ -127,6 +127,10 @@ function computeHierarchy(nodes, links) {
     const from = typeof l.source === "object" ? l.source.id : l.source;
     const to = typeof l.target === "object" ? l.target.id : l.target;
     if (!(from in inDegree) || !(to in inDegree)) continue;
+    if (from === to) continue; // a self-loop would inflate this node's own
+    // inDegree (counting itself as its own parent), knocking it out of
+    // `roots` while never actually linking it into anyone's adjacency list -
+    // silently orphaning it (and its real children) as a stray extra root.
     inDegree[to]++; outDegree[from]++;
     (adj[from] = adj[from] || []).push(to);
   }
