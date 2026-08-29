@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Lecture → Mind Map</title>
+<link rel="stylesheet" href="style.css">
+<!-- d3-force's standalone UMD bundle doesn't actually include its d3-timer
+     dependency (verified: throws "r.timer is not a function" at runtime) -
+     using the full d3 bundle instead, which is guaranteed complete. -->
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+</head>
+<body>
+
+<div id="topbar">
+  <h1>🎓 Lecture → Living Mind-Map</h1>
+  <div class="controls">
+    <button id="startBtn">▶ Start listening</button>
+    <button id="wrapupBtn">🎁 Wrap up</button>
+    <button id="fitViewBtn">🔍 Fit to view</button>
+    <button id="quizBtn">📝 Quiz me</button>
+  </div>
+  <p id="status">idle</p>
+  <div id="collapsibles">
+    <div class="panel-box">
+      <label>Live transcript</label>
+      <div id="transcript"></div>
+    </div>
+    <div class="panel-box">
+      <label>No mic, or recognition not picking up? Type/paste lecture text here — feeds the same pipeline.</label>
+      <textarea id="manualInput" placeholder="Paste or type lecture text here..."></textarea>
+    </div>
+  </div>
+</div>
+
+<div id="main">
+  <div id="viewport">
+    <div id="canvas">
+      <svg id="edgeLayer">
+        <defs>
+          <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="currentColor" style="fill: var(--muted, #888)"></path>
+          </marker>
+        </defs>
+      </svg>
+    </div>
+    <div class="placeholder-hint" id="placeholderHint">
+      Nothing on the map yet — start listening or paste some lecture text.
+      Concepts will appear here and grow as the lecture continues.
+    </div>
+  </div>
+
+  <div id="panel">
+    <div class="panel-hint">Click a concept on the map to explore it here.</div>
+  </div>
+</div>
+
+<div id="simOverlay">
+  <div class="sim-overlay-box">
+    <div class="sim-overlay-header">
+      <h3 id="simOverlayTitle">Simulation</h3>
+      <button id="simOverlayClose">✕ Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="quizOverlay">
+  <div class="sim-overlay-box quiz-box">
+    <div class="sim-overlay-header">
+      <h3>Quiz</h3>
+      <button id="quizOverlayClose">✕ Close</button>
+    </div>
+    <div id="quizContent"></div>
+  </div>
+</div>
+
+<div id="wrapupOverlay">
+  <div class="wrapup-page">
+    <button id="wrapupClose" class="wrapup-close">✕ Close &amp; keep going</button>
+    <div id="wrapupContent"></div>
+  </div>
+</div>
+
+<div id="toastContainer"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
