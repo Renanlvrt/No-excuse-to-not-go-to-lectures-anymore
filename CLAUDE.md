@@ -40,6 +40,11 @@ architectural decision; don't be surprised if a future shift swaps it out.
 3. **Replies to Renan must be short.** He's running on a treadmill while
    coding — can't read long text. Give the short answer, or a short
    question with 2-3 clickable recommended options. No preamble.
+4. **Push straight to `main`, no PR review gate needed.** Collaborators
+   pull and test locally on their own machine with their own real API keys
+   (Gemini/ElevenLabs) — that's the actual verification step, not a review
+   before merge. When asked to push/merge a change, just land it on `main`
+   directly instead of opening a PR and waiting.
 
 ## Where things are
 - `backend/main.py` — FastAPI app, one websocket (`/ws/lecture`) driving everything
