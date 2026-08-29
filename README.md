@@ -10,8 +10,9 @@ for the full objective checklist and what's actually been verified.
 ```powershell
 .\start.ps1
 ```
-Then open **http://localhost:8010/static/index.html** in **Chrome** (Web
-Speech API is Chrome/Edge-only; `GEMINI_API_KEY` is already set in `.env`).
+Then open **http://localhost:8010/static/index.html** (any modern browser -
+transcription is ElevenLabs Scribe server-side, not the Chrome-only Web
+Speech API; `GEMINI_API_KEY` and `ELEVENLABS_API_KEY` live in `.env`).
 
 Click **▶ Start listening** and talk. Concepts accumulate on a pannable/
 zoomable canvas roughly every ~20s (or hit **⚡ Generate diagram now**).
@@ -21,6 +22,16 @@ process get a **▶ Play** button that animates through their steps.
 
 **No mic, or recognition isn't picking anything up?** Type/paste lecture
 text into the box under the transcript — same pipeline, fully verified path.
+
+## Transcription: ElevenLabs Scribe realtime
+The mic is captured as PCM16 @16kHz in the browser and streamed over the
+app's own websocket to the backend, which relays it to ElevenLabs' realtime
+STT websocket (`scribe_v2_realtime`, VAD commit strategy) — so the API key
+never reaches the browser. `partial_transcript` events render as live
+interim text; `committed_transcript` events append to the server-side
+transcript that feeds the Gemini extraction loop. If `ELEVENLABS_API_KEY`
+is unset the backend announces `provider: browser` on connect and the
+frontend falls back to the Web Speech API exactly as before.
 
 ## How a concept becomes a card
 1. The transcript is sent to Gemini along with the concept map already built
@@ -89,9 +100,9 @@ uvicorn backend.main:app --port 8010
 
 ## Sponsors (RUN/HACK, London, Aug 29 2026)
 - **Google Gemini** — the actual LLM in use, powers everything
-- ElevenLabs / Tavily — planned but no working API key was found anywhere on
-  this machine; not wired in. Browser's built-in Web Speech API substitutes
-  for transcription (free, zero-key).
+- **ElevenLabs** — Scribe v2 realtime is now the transcription engine
+  (`backend/services/transcribe.py`); Web Speech API is only the fallback.
+- Tavily — no working API key; not wired in.
 - ⚠️ RUN/HACK's official sponsor list wasn't published as of building this —
   ElevenLabs/Tavily were guesses based on the hackathon name pattern, not
   confirmed sponsors.
@@ -113,7 +124,7 @@ backend/services/
                           into the prompt; merges + never-delete safety net)
   qa.py                   Per-node follow-up Q&A
   imagegen.py              On-demand image generation, its own model chain
-  transcribe.py            (unused - ElevenLabs STT, no key found)
+  transcribe.py            ElevenLabs Scribe: batch helper + realtime session
   enrich.py                (unused - Tavily search, no key found)
 ```
 

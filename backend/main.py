@@ -16,6 +16,7 @@ from backend.services.widgetgen import generate_widget
 from backend.services.videogen import generate_video, NeedsProPlanError, VIDEO_DIR
 from backend.services.quizgen import generate_quiz, generate_check_question
 from backend.services.summarygen import generate_summary
+from backend.services.transcribe import RealtimeTranscriber
 
 ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
 
@@ -45,7 +46,8 @@ def _find_node(graph: dict, node_id: str) -> dict | None:
 async def lecture_ws(ws: WebSocket):
     await ws.accept()
     state = {
-        "transcript": "",
+        "transcript": "",  # speech, owned by the server when ElevenLabs is transcribing
+        "manual": "",      # whatever is typed/pasted in the frontend's text box
         "last_extracted": "",
         "graph": {"nodes": [], "edges": []},
         # Everything here runs as blocking synchronous Gemini calls on one
@@ -60,8 +62,39 @@ async def lecture_ws(ws: WebSocket):
         # made during "listening" doesn't get queued behind a fresh 20s
         # extraction that was about to start anyway.
         "busy": False,
+        # live ElevenLabs Scribe session, created lazily on the first audio
+        # chunk so a listener who never turns the mic on costs nothing.
+        "stt": None,
     }
     force_event = asyncio.Event()
+
+    await ws.send_json({"type": "stt_status", "provider": "elevenlabs" if ELEVENLABS_API_KEY else "browser"})
+
+    async def on_partial(text: str):
+        await ws.send_json({"type": "partial_transcript", "text": text})
+
+    async def on_committed(text: str):
+        state["transcript"] = (state["transcript"] + " " + text).strip()
+        await ws.send_json({"type": "transcript", "text": state["transcript"], "committed": text})
+
+    async def on_stt_error(message: str):
+        await ws.send_json({"type": "error", "context": "transcribe", "message": message})
+
+    async def stop_transcriber(commit: bool):
+        transcriber = state["stt"]
+        state["stt"] = None
+        if not transcriber:
+            return
+        try:
+            if commit:
+                await transcriber.commit()
+                # give ElevenLabs a beat to emit the final committed segment
+                # before tearing the socket down, otherwise the last sentence
+                # spoken before "Stop" is silently lost.
+                await asyncio.sleep(1.0)
+        except Exception:
+            pass
+        await transcriber.close()
 
     async def handle_node_action(msg: dict, context: str, run, ok_payload):
         """Shared per-node action pattern (ask / generate_image /
@@ -166,6 +199,36 @@ async def lecture_ws(ws: WebSocket):
                 )
                 continue
 
+            if msg_type == "audio_chunk":
+                if not ELEVENLABS_API_KEY:
+                    continue  # frontend falls back to the browser's own recognition
+                if state["stt"] is None:
+                    try:
+                        transcriber = RealtimeTranscriber(
+                            ELEVENLABS_API_KEY, on_partial, on_committed, on_stt_error
+                        )
+                        await transcriber.start()
+                        state["stt"] = transcriber
+                    except Exception as e:
+                        await ws.send_json({
+                            "type": "error", "context": "transcribe",
+                            "message": f"could not start ElevenLabs transcription: {str(e)[:200]}",
+                        })
+                        continue
+                try:
+                    await state["stt"].send_audio(msg.get("audio_base_64", ""))
+                except Exception as e:
+                    await stop_transcriber(commit=False)
+                    await ws.send_json({
+                        "type": "error", "context": "transcribe",
+                        "message": f"transcription stream dropped: {str(e)[:200]}",
+                    })
+                continue
+
+            if msg_type == "audio_stop":
+                await stop_transcriber(commit=True)
+                continue
+
             if msg_type == "generate_video":
                 asyncio.create_task(handle_generate_video(msg))
                 continue
@@ -202,7 +265,16 @@ async def lecture_ws(ws: WebSocket):
                     state["busy"] = False
                 continue
 
-            # default: transcript update (existing behavior, no explicit type needed)
+            if msg_type == "manual_text":
+                # kept separate from the speech transcript: with ElevenLabs the
+                # server owns `transcript`, so letting the text box overwrite it
+                # would wipe everything already transcribed.
+                state["manual"] = msg.get("text", "")
+                if msg.get("force"):
+                    force_event.set()
+                continue
+
+            # default: transcript update (browser-recognition fallback, no explicit type needed)
             state["transcript"] = msg.get("text", state["transcript"])
             if msg.get("force"):
                 force_event.set()
@@ -233,7 +305,7 @@ async def lecture_ws(ws: WebSocket):
                 pass
             force_event.clear()
 
-            transcript = state["transcript"]
+            transcript = (state["transcript"] + " " + state["manual"]).strip()
             if not transcript:
                 continue
 
@@ -258,3 +330,5 @@ async def lecture_ws(ws: WebSocket):
         await asyncio.gather(receive_loop(), extraction_loop())
     except WebSocketDisconnect:
         pass
+    finally:
+        await stop_transcriber(commit=False)
