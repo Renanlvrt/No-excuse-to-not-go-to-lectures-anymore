@@ -16,26 +16,11 @@
   <h1>🎓 Lecture → Living Mind-Map</h1>
   <div class="controls">
     <button id="startBtn">▶ Start listening</button>
-    <button id="tabAudioBtn" title="Transcribe a lecture playing in another tab (share the tab and tick 'Share tab audio')">🔊 Listen to a tab</button>
     <button id="wrapupBtn">🎁 Wrap up</button>
     <button id="fitViewBtn">🔍 Fit to view</button>
     <button id="quizBtn">📝 Quiz me</button>
-    <label class="level-select">Whole map:
-      <select id="levelSelect">
-        <option value="1">1 · Intuition</option>
-        <option value="2" selected>2 · Mechanism</option>
-        <option value="3">3 · Rigour</option>
-      </select>
-    </label>
   </div>
   <p id="status">idle</p>
-  <div id="keyBox" class="key-box" hidden>
-    <label for="keyInput">This laptop has no ElevenLabs key in <code>.env</code> — paste one to transcribe (stored in this browser only):</label>
-    <div class="key-row">
-      <input id="keyInput" type="password" placeholder="sk_..." autocomplete="off" spellcheck="false">
-      <button id="keySaveBtn">Use key</button>
-    </div>
-  </div>
   <div id="collapsibles">
     <div class="panel-box">
       <label>Live transcript</label>
@@ -55,9 +40,6 @@
         <defs>
           <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
             <path d="M0,0 L8,4 L0,8 z" fill="currentColor" style="fill: var(--muted, #888)"></path>
-          </marker>
-          <marker id="arrowhead-faint" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
-            <path d="M0,0 L7,3.5 L0,7 z" style="fill: var(--muted, #888); opacity: 0.5"></path>
           </marker>
         </defs>
       </svg>

@@ -10,15 +10,11 @@ import google.generativeai as genai
 
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"), transport="rest")
 
-# Order matters for live latency, not just for quota. Measured on the demo
-# machine with a real extraction prompt: 3.1-flash-lite answers in ~2s, the
-# -latest aliases take 10-18s, and gemini-flash-latest is already 429ing.
-# Extraction blocks the event loop, so the fastest healthy model goes first.
 MODEL_FALLBACK_CHAIN = [
-    "gemini-3.1-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-3.6-flash",
     "gemini-flash-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
 ]
 
 _model_cache = {}
@@ -32,21 +28,11 @@ def _get_model(name: str, system_instruction: str):
     return _model_cache[key]
 
 
-def generate_with_fallback(
-    prompt: str,
-    system_instruction: str,
-    timeout: int = 15,
-    json_mode: bool = False,
-    max_attempts: int | None = None,
-) -> str:
-    """max_attempts bounds the worst case for callers that block the event loop:
-    the whole chain can otherwise cost len(chain) * timeout seconds."""
+def generate_with_fallback(prompt: str, system_instruction: str, timeout: int = 15, json_mode: bool = False) -> str:
     global _working_model_index
     last_error = None
     gen_config = genai.GenerationConfig(response_mime_type="application/json") if json_mode else None
     order = list(range(_working_model_index, len(MODEL_FALLBACK_CHAIN))) + list(range(_working_model_index))
-    if max_attempts is not None:
-        order = order[:max_attempts]
     for i in order:
         name = MODEL_FALLBACK_CHAIN[i]
         try:
@@ -56,12 +42,6 @@ def generate_with_fallback(
             )
         except Exception as e:
             last_error = e
-            # Move the sticky pointer off a model that just failed. Otherwise a
-            # model that runs out of daily quota stays first in line and, with
-            # max_attempts=2, burns half of every later call on a known-dead
-            # model - the app then only recovers on a server restart.
-            if _working_model_index == i:
-                _working_model_index = (i + 1) % len(MODEL_FALLBACK_CHAIN)
             continue
         _working_model_index = i
         return response.text or ""

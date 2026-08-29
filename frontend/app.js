@@ -31,12 +31,7 @@ const simOverlayBox = document.querySelector(".sim-overlay-box");
 const simOverlayTitle = document.getElementById("simOverlayTitle");
 const simOverlayClose = document.getElementById("simOverlayClose");
 
-const levelSelect = document.getElementById("levelSelect");
-const tabAudioBtn = document.getElementById("tabAudioBtn");
-const keyBox = document.getElementById("keyBox");
-const keyInput = document.getElementById("keyInput");
-const keySaveBtn = document.getElementById("keySaveBtn");
-
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let fullTranscript = "";
 let ws;
 let listening = false;      // mic/speech-recognition state
@@ -44,20 +39,6 @@ let wsConnected = false;    // websocket state - INDEPENDENT of listening now,
 // so ask/quiz/simulations/wrap-up etc. keep working after you hit Stop
 let reconnectDelay = 1000;
 let selectedNodeId = null;
-let hasKey = false;          // set by the backend's stt_status message
-// Three comprehension levels per concept, all read from text already in
-// memory: 1 = analogy (intuition), 2 = definition (mechanism), 3 = the
-// generated exam-level text. Switching levels NEVER triggers a request -
-// only the Rigour tab's explicit button does, once per concept ever.
-let globalLevel = 2;
-let partialTranscript = "";  // interim text, replaced as it firms up
-let audioStream = null, audioContext = null, audioNode = null, audioSource = null;
-
-// Chrome's own speech engine is the default mic path again: it transcribes
-// on-device with near-zero latency and costs no ElevenLabs quota. ElevenLabs
-// Scribe stays wired up for tab audio (Web Speech can't consume a MediaStream)
-// and as the fallback on browsers without the API.
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognitionInstance = null;
 
 function setStatus(text, kind) {
@@ -90,23 +71,17 @@ function wsReady() {
   return false;
 }
 
-// ---------- category visual language: color + shape + icon accent ----------
-const CATEGORY_STYLES = {
-  math:        { color: "#5b8def", icon: "Σ", shape: "diamond" },
-  code:        { color: "#8a5cf6", icon: "</>", shape: "hexagon" },
-  process:     { color: "#f5a623", icon: "→", shape: "hexagon" },
-  theory:      { color: "#2fb380", icon: "◎", shape: "rounded" },
-  warning:     { color: "#e5484d", icon: "!", shape: "diamond" },
-  definition:  { color: "#6b7280", icon: "§", shape: "rounded" },
-  interactive: { color: "#00acc1", icon: "⚙", shape: "hexagon" },
+// ---------- category colors ----------
+const CATEGORY_COLORS = {
+  math: "#5b8def", code: "#8a5cf6", process: "#f5a623", theory: "#2fb380",
+  warning: "#e5484d", definition: "#6b7280", interactive: "#00acc1",
 };
-function styleForCategory(cat) {
-  if (CATEGORY_STYLES[cat]) return CATEGORY_STYLES[cat];
+function colorForCategory(cat) {
+  if (CATEGORY_COLORS[cat]) return CATEGORY_COLORS[cat];
   let hash = 0;
   for (const ch of String(cat || "default")) hash = (hash * 31 + ch.charCodeAt(0)) % 360;
-  return { color: `hsl(${hash}, 62%, 55%)`, icon: "●", shape: "rounded" };
+  return `hsl(${hash}, 62%, 55%)`;
 }
-function colorForCategory(cat) { return styleForCategory(cat).color; }
 
 // ---------- node/graph state ----------
 // nodeState[id] doubles as the d3 simulation's node object (x/y/vx/vy live
@@ -116,164 +91,46 @@ window.nodeState = nodeState; // exposed for automated verification (see SUCCESS
 const nodesArr = [];
 let linksArr = [];
 const cardEls = {};   // id -> card DOM element
-const edgeEls = {};   // "from|to" -> {path, labelBg, labelEl, hasLabel}
+const edgeEls = {};   // "from|to" -> {line, label}
 
-const isCoarsePointer = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
-const BASE_CARD_W = isCoarsePointer ? 220 : 190, BASE_CARD_H = isCoarsePointer ? 130 : 110;
+const CARD_W = 190, CARD_H = 110;
 
-// ============================================================
-// Semantic Knowledge Map layout: hierarchy (from the LLM's own
-// parent -> child edges) decides WHERE everything goes; d3-force below is
-// only a lightweight smoother + spacing/collision pass on top of that, not
-// the layout algorithm itself.
-// ============================================================
-
-// ---------- 1. hierarchy: depth (ring) + primary parent (wedge nesting) ----
-// BFS from every "root" (no incoming edge) simultaneously, so a node's depth
-// is its shortest hierarchical distance from any root. Depth 1 = "major
-// concepts" ring around the implied lecture center; deeper rings = their
-// sub-concepts. Naturally cycle-safe (BFS never revisits a node) and
-// degrades gracefully to "everything is a root" before any edges exist yet.
-function computeHierarchy(nodes, links) {
-  const inDegree = {}, outDegree = {}, adj = {};
-  for (const n of nodes) { inDegree[n.id] = 0; outDegree[n.id] = 0; }
-  for (const l of links) {
-    const from = typeof l.source === "object" ? l.source.id : l.source;
-    const to = typeof l.target === "object" ? l.target.id : l.target;
-    if (!(from in inDegree) || !(to in inDegree)) continue;
-    if (from === to) continue; // a self-loop would inflate this node's own
-    // inDegree (counting itself as its own parent), knocking it out of
-    // `roots` while never actually linking it into anyone's adjacency list -
-    // silently orphaning it (and its real children) as a stray extra root.
-    inDegree[to]++; outDegree[from]++;
-    (adj[from] = adj[from] || []).push(to);
-  }
-
-  const depth = {}, primaryParentOf = {}, childrenOf = {};
-  const roots = nodes.filter((n) => inDegree[n.id] === 0);
-  const queue = [];
-  for (const r of roots) { depth[r.id] = 1; queue.push(r.id); }
-  let qi = 0;
-  while (qi < queue.length) {
-    const id = queue[qi++];
-    for (const childId of adj[id] || []) {
-      if (!(childId in depth)) {
-        depth[childId] = depth[id] + 1;
-        primaryParentOf[childId] = id;
-        (childrenOf[id] = childrenOf[id] || []).push(childId);
-        queue.push(childId);
+// ---------- d3-force simulation ----------
+function rectCollideForce() {
+  let nodes;
+  function force() {
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const overlapX = CARD_W - Math.abs(dx);
+        const overlapY = CARD_H - Math.abs(dy);
+        if (overlapX > 0 && overlapY > 0) {
+          if (overlapX < overlapY) {
+            const push = overlapX / 2 * (dx >= 0 ? 1 : -1) || 1;
+            a.vx -= push; b.vx += push;
+          } else {
+            const push = overlapY / 2 * (dy >= 0 ? 1 : -1) || 1;
+            a.vy -= push; b.vy += push;
+          }
+        }
       }
     }
   }
-  // A node BFS never reached is part of a pure cycle with no entry point
-  // (e.g. A->B->A, both have inDegree 1) - vanishingly rare from the LLM's
-  // output, but treat it as its own root rather than crash/hang.
-  for (const n of nodes) {
-    if (!(n.id in depth)) { depth[n.id] = 1; roots.push(n); }
-  }
-
-  return { depth, primaryParentOf, childrenOf, inDegree, outDegree, roots };
+  force.initialize = (n) => { nodes = n; };
+  return force;
 }
 
-// ---------- 2. importance: degree + depth-tier, mapped through a SQRT
-// scale (not linear) since it drives card AREA - matching standard
-// dataviz practice for size-encoded quantities. ----------
-function computeImportance(nodes, hier) {
-  const { inDegree, outDegree, depth } = hier;
-  let maxDegree = 1;
-  for (const n of nodes) maxDegree = Math.max(maxDegree, inDegree[n.id] + outDegree[n.id]);
-  const degreeScale = d3.scaleSqrt().domain([0, maxDegree]).range([0.85, 1.35]).clamp(true);
-  for (const n of nodes) {
-    const degree = inDegree[n.id] + outDegree[n.id];
-    const depthTierBoost = depth[n.id] === 1 ? 1.12 : depth[n.id] === 2 ? 1.0 : 0.92;
-    const scale = 0.7 * degreeScale(degree) + 0.3 * depthTierBoost;
-    n.importance = scale;
-    n.w = Math.round(BASE_CARD_W * scale);
-    n.h = Math.round(BASE_CARD_H * scale);
-    n.depth = depth[n.id];
-  }
-}
-
-// ---------- 3. angular layout: each node gets a wedge of the circle
-// proportional to its own + its descendants' footprint, subdivided
-// recursively (same idea as d3.tree()'s separation, hand-rolled radially).
-// Stable id-sort ordering means re-running this every ~20s keeps existing
-// nodes' wedges nearly unchanged - a new sibling narrows its neighbors a
-// little instead of reshuffling the whole ring. ----------
-function computeAngles(hier, sizeOf) {
-  const { childrenOf, roots } = hier;
-  const angle = {};
-  function subtreeWeight(id) {
-    let w = sizeOf(id);
-    for (const c of childrenOf[id] || []) w += subtreeWeight(c);
-    return w;
-  }
-  function assign(ids, startAngle, endAngle) {
-    const weights = ids.map(subtreeWeight);
-    const total = weights.reduce((a, b) => a + b, 0) || 1;
-    let a = startAngle;
-    ids.forEach((id, i) => {
-      const span = (endAngle - startAngle) * (weights[i] / total);
-      angle[id] = a + span / 2;
-      const kids = (childrenOf[id] || []).slice().sort();
-      if (kids.length) assign(kids, a, a + span);
-      a += span;
-    });
-  }
-  const rootIds = roots.map((r) => r.id).sort();
-  if (rootIds.length) assign(rootIds, 0, Math.PI * 2);
-  return angle;
-}
-
-// ---------- 4. ring radius per depth: grows to fit however many/large the
-// nodes at that depth actually are, instead of a fixed guess. ----------
-function computeRingRadii(nodes, hier) {
-  const { depth } = hier;
-  const maxDepth = nodes.length ? Math.max(...nodes.map((n) => depth[n.id])) : 1;
-  const perDepth = {};
-  for (const n of nodes) (perDepth[depth[n.id]] = perDepth[depth[n.id]] || []).push(n);
-  const radius = { 0: 0 };
-  const RING_GAP = 70;
-  for (let d = 1; d <= maxDepth; d++) {
-    const group = perDepth[d] || [];
-    const maxDim = group.length ? Math.max(...group.map((n) => Math.max(n.w, n.h))) : BASE_CARD_H;
-    const circumferenceNeeded = group.reduce((sum, n) => sum + n.w + 24, 0);
-    const minRadiusForSpacing = circumferenceNeeded / (Math.PI * 2);
-    radius[d] = Math.max(radius[d - 1] + maxDim / 2 + RING_GAP, minRadiusForSpacing, radius[d - 1] + 160);
-  }
-  return radius;
-}
-
-// ---------- 5. tie it together: compute every node's target anchor
-// (tx, ty). THIS is the layout algorithm - the force simulation below never
-// decides structure, only eases nodes toward these anchors and resolves
-// local spacing. ----------
-function applyHierarchyLayout() {
-  const hier = computeHierarchy(nodesArr, linksArr);
-  computeImportance(nodesArr, hier);
-  const angle = computeAngles(hier, (id) => nodeState[id].w);
-  const radius = computeRingRadii(nodesArr, hier);
-  for (const n of nodesArr) {
-    const r = radius[hier.depth[n.id]] ?? radius[1] ?? 200;
-    const a = angle[n.id] ?? 0;
-    n.tx = Math.cos(a - Math.PI / 2) * r;
-    n.ty = Math.sin(a - Math.PI / 2) * r;
-  }
-  return hier;
-}
-
-// ---------- 6. d3-force: lightweight smoothing + spacing ONLY. Weak charge
-// (just enough for organic local jitter, not global structure), forceX/Y
-// gently pull each node toward its hierarchy-computed anchor, and
-// forceCollide (sized to each card's real, importance-scaled footprint)
-// resolves overlap. Low alphaDecay + a mild reheat keeps existing nodes
-// drifting into a new layout rather than jumping. ----------
+// Tuned tighter than the initial defaults: the graph was spreading out
+// with large dead gaps between clusters, forcing zoom-out far enough that
+// labels became unreadable at scale (direct feedback). Less repulsion +
+// shorter links + a stronger center pull keeps it compact without
+// reintroducing card overlap (rectCollide still guarantees that separately).
 const simulation = d3.forceSimulation([])
-  .force("x", d3.forceX((d) => d.tx).strength(0.12))
-  .force("y", d3.forceY((d) => d.ty).strength(0.12))
-  .force("charge", d3.forceManyBody().strength(-30))
-  .force("collide", d3.forceCollide((d) => Math.hypot(d.w, d.h) / 2 + 14).strength(0.9).iterations(3))
-  .alphaDecay(0.05)
+  .force("charge", d3.forceManyBody().strength(-260))
+  .force("link", d3.forceLink([]).id((d) => d.id).distance(140))
+  .force("center", d3.forceCenter(0, 0).strength(0.06))
+  .force("rectCollide", rectCollideForce())
   .on("tick", onTick);
 
 function onTick() {
@@ -284,57 +141,44 @@ function onTick() {
   drawEdges();
 }
 
-// ---------- edges: curved paths, bowed outward from the shared centroid so
-// they sweep around already-placed cards near the hub instead of cutting
-// straight through them; labels ride the curve's midpoint on their own
-// background pill so they stay legible over any card color. ----------
 function drawEdges() {
   for (const key in edgeEls) {
-    const { path, labelBg, labelEl, hasLabel } = edgeEls[key];
+    const { line, labelEl } = edgeEls[key];
     const [fromId, toId] = key.split("|");
     const a = nodeState[fromId], b = nodeState[toId];
     if (!a || !b) continue;
-    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-    const centerDist = Math.hypot(mx, my) || 1;
-    const outX = mx / centerDist, outY = my / centerDist;
-    const bow = 22 + Math.min(60, Math.hypot(b.x - a.x, b.y - a.y) * 0.12);
-    const cx = mx + outX * bow, cy = my + outY * bow;
-    path.setAttribute("d", `M${a.x},${a.y} Q${cx},${cy} ${b.x},${b.y}`);
-
-    if (hasLabel) {
-      labelEl.setAttribute("x", cx);
-      labelEl.setAttribute("y", cy);
-      try {
-        const bbox = labelEl.getBBox();
-        labelBg.setAttribute("x", bbox.x - 4);
-        labelBg.setAttribute("y", bbox.y - 2);
-        labelBg.setAttribute("width", bbox.width + 8);
-        labelBg.setAttribute("height", bbox.height + 4);
-      } catch (e) { /* getBBox can throw before first paint in some engines - skip a frame */ }
-    }
+    line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+    line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+    labelEl.setAttribute("x", (a.x + b.x) / 2);
+    labelEl.setAttribute("y", (a.y + b.y) / 2 - 4);
   }
 }
 
-// ---------- graph merge (never delete; hierarchy recomputed every update,
-// existing nodes drift gently rather than jump - see applyHierarchyLayout
-// and the gentle alpha reheat below). ----------
+// ---------- graph merge (never delete, reheat sim gently on new nodes) ----------
 function mergeGraph(data) {
+  const parentOf = {};
+  for (const e of data.edges || []) parentOf[e.to] = e.from;
+
   let addedAny = false;
-  const newlyAdded = [];
   for (const n of data.nodes || []) {
     if (nodeState[n.id]) {
-      // whitelist: anything generated client-side (deep text, image, qa...)
-      // must NOT be listed here or an extraction cycle would wipe it.
       Object.assign(nodeState[n.id], {
         label: n.label, definition: n.definition, analogy: n.analogy, category: n.category,
         mode: n.mode, steps: n.steps || [],
       });
     } else {
+      const parentId = parentOf[n.id];
+      let x, y;
+      if (parentId && nodeState[parentId]) {
+        x = nodeState[parentId].x + (Math.random() - 0.5) * 40;
+        y = nodeState[parentId].y + 160 + (Math.random() - 0.5) * 40;
+      } else {
+        x = (Math.random() - 0.5) * 120;
+        y = (Math.random() - 0.5) * 120;
+      }
       const node = Object.assign(
         {
-          x: 0, y: 0, vx: 0, vy: 0, tx: 0, ty: 0,
-          w: BASE_CARD_W, h: BASE_CARD_H, importance: 1, depth: 1,
-          qa: [], image: null, widgetHtml: null,
+          x, y, vx: 0, vy: 0, qa: [], image: null, widgetHtml: null,
           isNew: true, playing: false, currentStep: -1, pausedAtStep: null,
           lastError: null,
           // Persisted (not just local DOM state) so a pending request
@@ -344,15 +188,12 @@ function mergeGraph(data) {
           // double-fire a duplicate request for the same node.
           widgetPending: false, imagePending: false, askPending: false,
           videoPending: false, videoUrl: null,
-          deep: null, deepPending: false, level: null, // level: per-node override of globalLevel
-          audioUrls: {}, audioPending: false, // per-level TTS, keyed 1/2/3
           checkPending: false, checkQuestion: null, checkAnswered: false,
         },
         n, { steps: n.steps || [] }
       );
       nodeState[n.id] = node;
       nodesArr.push(node);
-      newlyAdded.push(node);
       addedAny = true;
     }
   }
@@ -361,119 +202,53 @@ function mergeGraph(data) {
     .filter((e) => nodeState[e.from] && nodeState[e.to])
     .map((e) => ({ source: e.from, target: e.to, label: e.label }));
 
-  // Layout: recompute hierarchy/importance/anchors for the whole graph.
-  // Stable id-sorted angle assignment means existing nodes' anchors shift
-  // only a little (a new sibling narrows their wedge) - not a full reshuffle.
-  const hier = applyHierarchyLayout();
-
-  // Brand-new nodes start AT their primary parent's current on-screen
-  // position (or their own target anchor if root-level) so they visually
-  // grow outward from what's already there instead of popping in randomly.
-  for (const node of newlyAdded) {
-    const parent = nodeState[hier.primaryParentOf[node.id]];
-    node.x = parent ? parent.x : node.tx;
-    node.y = parent ? parent.y : node.ty;
-  }
-
   simulation.nodes(nodesArr);
-  // Gentle reheat only: the graph should drift into its new layout, not
-  // jump - a hard restart every ~20s would fight "preserve existing
-  // positions where practical."
-  simulation.alpha(Math.max(simulation.alpha(), addedAny ? 0.35 : 0.15)).restart();
+  simulation.force("link").links(linksArr);
+  if (addedAny) simulation.alpha(0.6).restart();
 
   renderAllCards();
-  renderEdgeElements(hier);
+  renderEdgeElements();
   if (nodesArr.length) placeholderHint.style.display = "none";
 }
 
-// A link is a "tree" edge if it's how its target actually got placed in the
-// hierarchy (its primary parent); anything else - a second parent, a
-// same-rank cross-reference - is a "crosslink": still drawn, but visually
-// subordinate (thinner/dashed) so the primary structure stays legible.
-function edgeKind(hier, fromId, toId) {
-  return hier.primaryParentOf[toId] === fromId ? "tree" : "crosslink";
-}
-
-function renderEdgeElements(hier) {
+function renderEdgeElements() {
   for (const e of linksArr) {
     const fromId = typeof e.source === "object" ? e.source.id : e.source;
     const toId = typeof e.target === "object" ? e.target.id : e.target;
     const key = `${fromId}|${toId}`;
     if (!edgeEls[key]) {
-      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      const labelBg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
       const labelEl = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      labelBg.setAttribute("class", "edge-label-bg");
-      labelEl.setAttribute("class", "edge-label-text");
       labelEl.setAttribute("text-anchor", "middle");
       labelEl.textContent = e.label || "";
-      const hasLabel = !!e.label;
-      edgeLayer.appendChild(path);
-      if (hasLabel) { edgeLayer.appendChild(labelBg); edgeLayer.appendChild(labelEl); }
-      edgeEls[key] = { path, labelBg, labelEl, hasLabel };
+      edgeLayer.appendChild(line);
+      edgeLayer.appendChild(labelEl);
+      edgeEls[key] = { line, labelEl };
     }
-    const kind = edgeKind(hier, fromId, toId);
-    edgeEls[key].path.setAttribute("class", `edge-path edge-${kind}`);
-    edgeEls[key].path.setAttribute("marker-end", kind === "tree" ? "url(#arrowhead)" : "url(#arrowhead-faint)");
   }
 }
 
-// ---------- card rendering: size/weight reflect computed importance
-// (bigger, bolder cards for hub/foundational concepts); category maps to a
-// color + icon + accent shape, not just a border color. ----------
-function applyCardSizing(card, node) {
-  card.style.setProperty("--w", node.w + "px");
-  card.style.setProperty("--h", node.h + "px");
-  card.style.setProperty("--scale", node.importance || 1);
-  card.classList.toggle("important", (node.importance || 1) >= 1.15);
-}
-
+// ---------- card rendering (lightweight: label + tiny flip-back definition) ----------
 function renderAllCards() {
   for (const id in nodeState) {
-    const node = nodeState[id];
-    if (!cardEls[id]) createCard(node);
-    else applyCardSizing(cardEls[id], node);
-  }
-  refreshCardBacks();
-}
-
-// A card's back face shows the current level's text. Level 3 falls back to
-// the definition for any node whose deep text hasn't been generated - the
-// global switch is a pure in-memory re-render, it never fetches anything.
-function levelText(node, level) {
-  if (level === 1) return node.analogy || node.definition || node.label;
-  if (level === 3) return node.deep || node.definition || node.label;
-  return node.definition || node.label;
-}
-
-function refreshCardBacks() {
-  for (const id in cardEls) {
-    const node = nodeState[id];
-    const def = cardEls[id].querySelector(".card-definition");
-    if (node && def) def.textContent = levelText(node, globalLevel);
+    if (!cardEls[id]) createCard(nodeState[id]);
   }
 }
 
 function createCard(node) {
   const card = document.createElement("div");
-  const catStyle = styleForCategory(node.category);
-  card.className = `card entering shape-${catStyle.shape}`;
+  card.className = "card entering";
   card.dataset.nodeId = node.id;
-  applyCardSizing(card, node);
 
   const inner = document.createElement("div");
   inner.className = "card-inner";
 
   const front = document.createElement("div");
   front.className = "card-face card-front";
-  front.style.setProperty("--card-color", catStyle.color);
+  front.style.setProperty("--card-color", colorForCategory(node.category));
   const badge = document.createElement("div");
   badge.className = "card-badge";
-  const badgeIcon = document.createElement("span");
-  badgeIcon.className = "card-badge-icon";
-  badgeIcon.textContent = catStyle.icon;
-  badge.appendChild(badgeIcon);
-  badge.appendChild(document.createTextNode(node.category || "concept"));
+  badge.textContent = node.category || "concept";
   const label = document.createElement("div");
   label.className = "card-label";
   label.textContent = node.label; // textContent only - never innerHTML with LLM text
@@ -488,10 +263,10 @@ function createCard(node) {
 
   const back = document.createElement("div");
   back.className = "card-face card-back";
-  back.style.setProperty("--card-color", catStyle.color);
+  back.style.setProperty("--card-color", colorForCategory(node.category));
   const def = document.createElement("div");
   def.className = "card-definition";
-  def.textContent = levelText(node, globalLevel);
+  def.textContent = node.definition || node.label;
   back.appendChild(def);
 
   inner.appendChild(front);
@@ -511,9 +286,6 @@ function createCard(node) {
 // ---------- right panel: the real interaction surface for one selected node ----------
 function selectNode(nodeId) {
   selectedNodeId = nodeId;
-  // the server needs to know which card a spoken "explain that simpler"
-  // refers to.
-  if (wsReady()) ws.send(JSON.stringify({ type: "select_node", node_id: nodeId }));
   for (const id in cardEls) cardEls[id].classList.toggle("selected", id === nodeId);
   renderPanel();
 }
@@ -529,11 +301,10 @@ function renderPanel() {
     return;
   }
 
-  const catStyle = styleForCategory(node.category);
   const badge = document.createElement("div");
   badge.className = "card-badge";
-  badge.style.setProperty("--card-color", catStyle.color);
-  badge.textContent = `${catStyle.icon} ${node.category || "concept"}`;
+  badge.style.setProperty("--card-color", colorForCategory(node.category));
+  badge.textContent = node.category || "concept";
   panelEl.appendChild(badge);
 
   const title = document.createElement("h2");
@@ -541,7 +312,17 @@ function renderPanel() {
   title.textContent = node.label;
   panelEl.appendChild(title);
 
-  renderLevelSection(node);
+  if (node.analogy) {
+    const analogy = document.createElement("p");
+    analogy.className = "panel-analogy";
+    analogy.textContent = "💡 " + node.analogy;
+    panelEl.appendChild(analogy);
+  }
+
+  const def = document.createElement("p");
+  def.className = "panel-definition";
+  def.textContent = node.definition || "";
+  panelEl.appendChild(def);
 
   if (node.lastError) {
     const err = document.createElement("div");
@@ -555,110 +336,6 @@ function renderPanel() {
   renderVideoSection(node);
   renderImageSection(node);
   renderQaSection(node);
-}
-
-// ---------- three comprehension levels ----------
-// L1 and L2 are text the node already carries (analogy / definition), so
-// switching between them is free. L3 is generated once per concept, on an
-// explicit click, and cached server-side forever after.
-const LEVELS = [
-  { n: 1, name: "Intuition", hint: "What is this like?" },
-  { n: 2, name: "Mechanism", hint: "How does it actually work?" },
-  { n: 3, name: "Rigour", hint: "What would a professor grill you on?" },
-];
-
-function renderLevelSection(node) {
-  const level = node.level || globalLevel;
-
-  const tabs = document.createElement("div");
-  tabs.className = "level-tabs";
-  for (const l of LEVELS) {
-    const tab = document.createElement("button");
-    tab.className = "level-tab" + (l.n === level ? " active" : "");
-    tab.textContent = l.name;
-    tab.title = l.hint;
-    tab.addEventListener("click", () => {
-      node.level = l.n; // remembered per node, so coming back keeps this level
-      renderPanel();
-    });
-    tabs.appendChild(tab);
-  }
-  panelEl.appendChild(tabs);
-
-  const body = document.createElement("p");
-  body.className = "panel-definition";
-  panelEl.appendChild(body);
-
-  renderSpeakButton(node, level);
-
-  if (level === 1) {
-    body.textContent = node.analogy || "No analogy for this concept — try Mechanism.";
-    return;
-  }
-  if (level === 2) {
-    body.textContent = node.definition || "";
-    return;
-  }
-
-  if (node.deep) {
-    body.textContent = node.deep;
-    return;
-  }
-  body.textContent = node.definition || "";
-  const btn = document.createElement("button");
-  if (node.deepPending) {
-    btn.textContent = "Generating…";
-    btn.disabled = true;
-  } else {
-    btn.textContent = "🎓 Go deeper";
-    btn.addEventListener("click", () => requestDeep(node));
-  }
-  panelEl.appendChild(btn);
-}
-
-// One voice per level (warm/slow, neutral, fast/dense) so the sound says
-// which level you're on. Synthesis is cached per (concept, level) on the
-// server, so replaying costs zero characters of the TTS quota.
-function renderSpeakButton(node, level) {
-  const url = (node.audioUrls || {})[level];
-  if (url) {
-    const audio = document.createElement("audio");
-    audio.src = url;
-    audio.controls = true;
-    audio.autoplay = node.audioAutoplay === level; // only the freshly returned one
-    node.audioAutoplay = null;
-    audio.className = "level-audio";
-    panelEl.appendChild(audio);
-    return;
-  }
-  const btn = document.createElement("button");
-  btn.className = "speak-btn";
-  if (node.audioPending) {
-    btn.textContent = "Voicing…";
-    btn.disabled = true;
-  } else {
-    btn.textContent = "🔊 Read it to me";
-    btn.addEventListener("click", () => requestSpeak(node, level));
-  }
-  panelEl.appendChild(btn);
-}
-
-function requestSpeak(node, level) {
-  if (node.audioPending) return;
-  if (!wsReady()) return;
-  node.lastError = null;
-  node.audioPending = true;
-  ws.send(JSON.stringify({ type: "speak_level", node_id: node.id, level }));
-  if (selectedNodeId === node.id) renderPanel();
-}
-
-function requestDeep(node) {
-  if (node.deepPending) return;
-  if (!wsReady()) return;
-  node.lastError = null;
-  node.deepPending = true;
-  ws.send(JSON.stringify({ type: "explain_deep", node_id: node.id }));
-  if (selectedNodeId === node.id) renderPanel();
 }
 
 // ---------- teaching video (ElevenLabs - needs a Pro-tier key; wired and
@@ -1074,148 +751,21 @@ startBtn.onclick = () => {
     startBtn.textContent = "▶ Start listening";
     startBtn.classList.remove("active");
     if (recognitionInstance) { try { recognitionInstance.stop(); } catch (e) {} }
-    recognitionInstance = null;
-    stopElevenLabsCapture();
     setStatus(wsConnected ? "stopped listening (still connected)" : "stopped", "ok");
-    return;
-  }
-  if (!SpeechRecognition && !hasKey) {
-    keyBox.hidden = false;
-    keyInput.focus();
-    showToast("This browser has no speech engine - paste an ElevenLabs key above instead.", "err");
     return;
   }
   listening = true;
   startBtn.textContent = "■ Stop";
   startBtn.classList.add("active");
   if (SpeechRecognition) startRecognition();
-  else startElevenLabsCapture();
+  else showToast("Speech recognition not supported in this browser - use the text box below instead.", "err");
 };
-
-// Interim results are forwarded too, so words feed concept extraction as they
-// are spoken instead of only when Chrome finalises a sentence.
-function startRecognition() {
-  const recognition = new SpeechRecognition();
-  recognitionInstance = recognition;
-  recognition.continuous = true;
-  recognition.interimResults = true;
-  recognition.lang = "en-US";
-
-  recognition.onresult = (event) => {
-    let interim = "";
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const chunk = event.results[i][0].transcript;
-      if (event.results[i].isFinal) {
-        if (wsReady()) ws.send(JSON.stringify({ type: "speech_segment", text: chunk }));
-      } else {
-        interim += chunk;
-      }
-    }
-    partialTranscript = interim;
-    renderTranscript();
-    if (interim && wsReady()) ws.send(JSON.stringify({ type: "speech_partial", text: interim }));
-  };
-
-  recognition.onerror = (event) => {
-    if (event.error === "no-speech" || event.error === "aborted") return;
-    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-      showToast("Mic permission denied - allow microphone access, or use the text box below.", "err");
-      return;
-    }
-    showToast(`Mic error: ${event.error} - use the text box below if this persists.`, "err");
-  };
-
-  // Chrome ends the session on every longer silence; restart so a whole
-  // lecture keeps transcribing without anyone touching the button.
-  recognition.onend = () => { if (listening && recognitionInstance === recognition) { try { recognition.start(); } catch (e) {} } };
-  try {
-    recognition.start();
-    setStatus("listening 🎙️ (Chrome speech)", "ok");
-  } catch (e) {
-    setStatus("Could not start microphone - use the text box below instead.", "err");
-  }
-}
-
-tabAudioBtn.onclick = () => {
-  if (listening) { startBtn.click(); return; }
-  if (!hasKey) {
-    keyBox.hidden = false;
-    keyInput.focus();
-    showToast("Paste an ElevenLabs API key above to start transcribing.", "err");
-    return;
-  }
-  startTabAudioCapture();
-};
-
-// A friend's laptop has no .env, so the key can also be pasted here: it stays
-// in this browser's localStorage and is handed to our own backend (which is
-// what talks to ElevenLabs), never to a third party.
-const KEY_STORAGE = "elevenlabs_api_key";
-
-function sendStoredKey() {
-  const key = localStorage.getItem(KEY_STORAGE) || "";
-  if (key && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "elevenlabs_key", key }));
-  }
-}
-
-keySaveBtn.onclick = () => {
-  const key = keyInput.value.trim();
-  if (!key) return;
-  localStorage.setItem(KEY_STORAGE, key);
-  if (!wsReady()) return;
-  ws.send(JSON.stringify({ type: "elevenlabs_key", key }));
-  showToast("Key saved in this browser - press Start listening.", "ok", 4000);
-};
-keyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") keySaveBtn.click(); });
-
-// Purely a re-render of text already in memory: flipping the whole map to
-// another level costs exactly zero API calls, however many nodes there are.
-levelSelect.addEventListener("change", () => {
-  globalLevel = Number(levelSelect.value);
-  for (const id in nodeState) nodeState[id].level = null; // global choice wins over per-node ones
-  refreshCardBacks();
-  renderPanel();
-});
 
 manualInput.addEventListener("input", () => {
   if (!wsReady()) return;
-  sendManualText();
+  const text = (fullTranscript + " " + manualInput.value).trim();
+  ws.send(JSON.stringify({ text }));
 });
-
-// The typed text box is sent under its own message type: with ElevenLabs the
-// server owns the speech transcript, so a plain `{text}` update (which
-// replaces it wholesale) would erase everything transcribed so far.
-function sendManualText(force = false) {
-  if (!wsReady()) return;
-  ws.send(JSON.stringify({ type: "manual_text", text: manualInput.value, force }));
-}
-
-// The uncommitted tail is shown greyed-out with a caret, so you can see the
-// words arriving live (they already feed extraction server-side) and see the
-// moment ElevenLabs firms them up.
-// Only the visible tail is rendered: a full lecture's transcript in one text
-// node makes every partial (several a second) re-layout the whole panel. The
-// complete text still lives in `fullTranscript` and server-side.
-const TRANSCRIPT_RENDER_CHARS = 4000;
-
-function renderTranscript() {
-  // don't fight someone who scrolled back to re-read something
-  const atBottom = transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 24;
-  transcriptEl.textContent = "";
-  const committed = document.createElement("span");
-  committed.textContent = fullTranscript.length > TRANSCRIPT_RENDER_CHARS
-    ? "… " + fullTranscript.slice(-TRANSCRIPT_RENDER_CHARS)
-    : fullTranscript;
-  transcriptEl.appendChild(committed);
-  if (partialTranscript) {
-    const partial = document.createElement("span");
-    partial.className = "transcript-partial";
-    partial.textContent = (fullTranscript ? " " : "") + partialTranscript;
-    transcriptEl.appendChild(partial);
-  }
-  if (atBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
-}
 
 function connect() {
   setStatus("connecting...");
@@ -1225,30 +775,13 @@ function connect() {
     wsConnected = true;
     setStatus(listening ? "listening 🎙️" : "connected", "ok");
     reconnectDelay = 1000;
-    sendStoredKey();
-    if (manualInput.value.trim() || fullTranscript.trim()) sendManualText();
+    const combined = (fullTranscript + " " + manualInput.value).trim();
+    if (combined) ws.send(JSON.stringify({ text: combined }));
   };
 
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.type === "stt_status") {
-      hasKey = !!msg.has_key;
-      // with Chrome's own engine handling the mic, a missing ElevenLabs key
-      // only matters for tab audio - don't block the demo over it.
-      keyBox.hidden = hasKey || !!SpeechRecognition;
-      if (hasKey) keyInput.value = "";
-    } else if (msg.type === "partial_transcript") {
-      partialTranscript = msg.text || "";
-      renderTranscript();
-    } else if (msg.type === "transcript") {
-      // append the one new final rather than mirroring the server's copy: a
-      // reconnect gives the server a fresh empty transcript, and mirroring it
-      // would wipe everything said before the socket dropped.
-      if (msg.committed) fullTranscript = (fullTranscript + " " + msg.committed).trim();
-      else fullTranscript = msg.text || "";
-      partialTranscript = "";
-      renderTranscript();
-    } else if (msg.type === "diagram") {
+    if (msg.type === "diagram") {
       mergeGraph(msg.data);
       if (listening) setStatus("listening 🎙️", "ok");
     } else if (msg.type === "empty") {
@@ -1263,12 +796,8 @@ function connect() {
           : "Video generation failed - try again later.",
         ask: "That didn't go through - try asking again.",
         generate_check: "Couldn't generate a check question - try again.",
-        explain_deep: "Couldn't generate the rigorous version - try again.",
-        speak_level: "Couldn't read that out loud - try again.",
         generate_quiz: "Couldn't generate the quiz - try again.",
         generate_summary: "Couldn't generate the wrap-up summary - try again.",
-        transcribe: "ElevenLabs transcription dropped - press Stop then Start to reconnect, or use the text box below.",
-        no_key: "No ElevenLabs API key on this machine - paste one in the box at the top.",
       };
       const friendly = messages[msg.context] || `Gemini isn't accessible right now: ${msg.message}`;
       showToast(friendly, "err");
@@ -1287,8 +816,6 @@ function connect() {
         if (msg.context === "generate_video") node.videoPending = false;
         if (msg.context === "ask") node.askPending = false;
         if (msg.context === "generate_check") node.checkPending = false;
-        if (msg.context === "explain_deep") node.deepPending = false;
-        if (msg.context === "speak_level") node.audioPending = false;
         if (selectedNodeId === msg.node_id) renderPanel();
       }
 
@@ -1322,35 +849,6 @@ function connect() {
       if (node) {
         node.qa.push({ question: msg.question, answer: msg.answer });
         node.askPending = false;
-        if (selectedNodeId === msg.node_id) renderPanel();
-      }
-    } else if (msg.type === "audio") {
-      const node = nodeState[msg.node_id];
-      if (node) {
-        if (!node.audioUrls) node.audioUrls = {};
-        node.audioUrls[msg.level] = msg.audio_url;
-        node.audioPending = false;
-        node.audioAutoplay = msg.level;
-        if (selectedNodeId === msg.node_id) renderPanel();
-      }
-    } else if (msg.type === "level_intent") {
-      // spoken command ("explain that simpler") matched server-side by a
-      // local regex - no LLM call, so it lands instantly.
-      const node = nodeState[msg.node_id];
-      if (node) {
-        node.level = msg.level;
-        setStatus(`🎙 "${msg.phrase}" → level ${msg.level}`, "ok");
-        if (selectedNodeId === msg.node_id) renderPanel();
-        if (msg.level === 3 && !node.deep) requestDeep(node);
-      }
-    } else if (msg.type === "deep") {
-      const node = nodeState[msg.node_id];
-      if (node) {
-        node.deep = msg.text;
-        node.deepPending = false;
-        node.level = 3;
-        if (msg.cached) setStatus("⚡ instant - seen this concept before", "ok");
-        refreshCardBacks();
         if (selectedNodeId === msg.node_id) renderPanel();
       }
     } else if (msg.type === "image") {
@@ -1404,108 +902,43 @@ function connect() {
   ws.onerror = () => setStatus("connection error - retrying...", "err");
 }
 
-// ---------- ElevenLabs Scribe realtime: audio -> PCM16 16kHz -> our backend
-// websocket -> ElevenLabs. The API key stays server-side, and the browser
-// never has to be Chrome/Edge (no Web Speech API involved). ----------
+function startRecognition() {
+  const recognition = new SpeechRecognition();
+  recognitionInstance = recognition; // so Stop can actually call .stop() on it
+  recognition.continuous = true;
+  recognition.interimResults = false;
+  recognition.lang = "en-US";
 
-// A lecture is far-field speech, and it is often a recording playing out of
-// this same laptop. Both browser "cleanups" work against that: echo
-// cancellation treats anything also coming out of the speakers as echo and
-// subtracts it (so a lecture video playing on this machine transcribes as
-// near-silence), and noise suppression chews up a distant voice across a
-// room. Raw is what Scribe wants.
-const MIC_CONSTRAINTS = {
-  echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1,
-};
-
-async function startElevenLabsCapture() {
-  try {
-    audioStream = await navigator.mediaDevices.getUserMedia({ audio: MIC_CONSTRAINTS });
-  } catch (e) {
-    listening = false;
-    startBtn.textContent = "▶ Start listening";
-    startBtn.classList.remove("active");
-    showToast("Mic permission denied - allow microphone access, or use the text box below instead.", "err");
-    return;
-  }
-  await pumpStreamToScribe("listening 🎙️ (ElevenLabs Scribe)");
-}
-
-// Transcribe a lecture playing in another tab (a recorded lecture, a video
-// call) by capturing that tab's audio directly instead of routing it through
-// the room and back in via the mic - no speaker volume, no echo, no room
-// noise, and it is the only way this works at all on a machine whose mic
-// can't hear its own output.
-async function startTabAudioCapture() {
-  let display;
-  try {
-    display = await navigator.mediaDevices.getDisplayMedia({
-      video: true,  // Chrome refuses an audio-only capture; the track is dropped below
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
-  } catch (e) {
-    showToast("Tab capture cancelled.", "err");
-    return;
-  }
-  if (!display.getAudioTracks().length) {
-    display.getTracks().forEach((t) => t.stop());
-    showToast("That capture had no audio - pick a tab and tick 'Share tab audio'.", "err");
-    return;
-  }
-  display.getVideoTracks().forEach((t) => { t.stop(); display.removeTrack(t); });
-  audioStream = display;
-  listening = true;
-  startBtn.textContent = "■ Stop";
-  startBtn.classList.add("active");
-  tabAudioBtn.classList.add("active");
-  // the user can also end the share from Chrome's own bar
-  audioStream.getAudioTracks()[0].onended = () => { if (listening) startBtn.click(); };
-  await pumpStreamToScribe("listening 🔊 (tab audio → ElevenLabs Scribe)");
-}
-
-async function pumpStreamToScribe(statusText) {
-  // asking the AudioContext for 16kHz directly means no manual resampling:
-  // it's exactly the rate the realtime API expects (pcm_16000).
-  audioContext = new AudioContext({ sampleRate: 16000 });
-  await audioContext.resume();
-  audioSource = audioContext.createMediaStreamSource(audioStream);
-  audioNode = audioContext.createScriptProcessor(4096, 1, 1);
-
-  audioNode.onaudioprocess = (event) => {
-    if (!listening || !wsReady()) return;
-    const input = event.inputBuffer.getChannelData(0);
-    const pcm = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  recognition.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      if (event.results[i].isFinal) {
+        fullTranscript += " " + event.results[i][0].transcript;
+        transcriptEl.textContent = fullTranscript;
+        transcriptEl.scrollTop = transcriptEl.scrollHeight;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ text: (fullTranscript + " " + manualInput.value).trim() }));
+        }
+      }
     }
-    let binary = "";
-    const bytes = new Uint8Array(pcm.buffer);
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    ws.send(JSON.stringify({ type: "audio_chunk", audio_base_64: btoa(binary) }));
   };
 
-  audioSource.connect(audioNode);
-  // ScriptProcessor only fires while connected to a destination; a zero-gain
-  // node keeps it running without playing the mic back through the speakers.
-  const mute = audioContext.createGain();
-  mute.gain.value = 0;
-  audioNode.connect(mute);
-  mute.connect(audioContext.destination);
-  setStatus(statusText, "ok");
-}
+  recognition.onerror = (event) => {
+    console.error("SpeechRecognition error:", event.error);
+    if (event.error === "no-speech") return;
+    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+      showToast("Mic permission denied - allow microphone access, or use the text box below instead.", "err");
+      return;
+    }
+    if (event.error === "network") {
+      showToast("Speech recognition needs network access and failed - use the text box below instead.", "err");
+      return;
+    }
+    showToast(`Mic error: ${event.error} - use the text box below if this persists.`, "err");
+  };
 
-function stopElevenLabsCapture() {
-  if (audioNode) { try { audioNode.disconnect(); } catch (e) {} audioNode = null; }
-  if (audioSource) { try { audioSource.disconnect(); } catch (e) {} audioSource = null; }
-  if (audioContext) { try { audioContext.close(); } catch (e) {} audioContext = null; }
-  if (audioStream) { audioStream.getTracks().forEach((t) => t.stop()); audioStream = null; }
-  tabAudioBtn.classList.remove("active");
-  partialTranscript = "";
-  renderTranscript();
-  if (wsReady()) ws.send(JSON.stringify({ type: "audio_stop" }));
+  recognition.onend = () => { if (listening) { try { recognition.start(); } catch (e) {} } };
+  try { recognition.start(); } catch (e) { setStatus("Could not start microphone - use the text box below instead.", "err"); }
 }
-
 
 // ---------- pan / zoom (pointer events: mouse + touch + pinch) ----------
 let panX = 0, panY = 0, zoom = 1;
@@ -1569,9 +1002,8 @@ function fitToView() {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const id of ids) {
     const n = nodeState[id];
-    const w = n.w || BASE_CARD_W, h = n.h || BASE_CARD_H;
-    minX = Math.min(minX, n.x - w / 2); maxX = Math.max(maxX, n.x + w / 2);
-    minY = Math.min(minY, n.y - h / 2); maxY = Math.max(maxY, n.y + h / 2);
+    minX = Math.min(minX, n.x - CARD_W / 2); maxX = Math.max(maxX, n.x + CARD_W / 2);
+    minY = Math.min(minY, n.y - CARD_H / 2); maxY = Math.max(maxY, n.y + CARD_H / 2);
   }
   const graphW = maxX - minX, graphH = maxY - minY;
   const vw = viewport.clientWidth, vh = viewport.clientHeight;

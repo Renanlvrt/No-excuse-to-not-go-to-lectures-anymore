@@ -91,9 +91,7 @@ def extract_flowchart(transcript_so_far: str, existing_graph: dict) -> dict:
         f"{json.dumps(_compact(existing_graph))}\n\n"
         f"TRANSCRIPT:\n{transcript_so_far[-4000:]}"
     )
-    # extraction blocks the event loop (no threads here - see HANDOVER), so its
-    # worst case is capped at timeout * max_attempts to keep partials flowing
-    text = generate_with_fallback(prompt, SYSTEM, timeout=10, json_mode=True, max_attempts=2)
+    text = generate_with_fallback(prompt, SYSTEM, timeout=15, json_mode=True)
     text = text.strip().strip("```json").strip("```")  # belt-and-suspenders even with json_mode
     try:
         new_graph = json.loads(text)

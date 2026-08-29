@@ -1,7 +1,6 @@
 """FastAPI app: live transcript text in -> live growing concept-graph out."""
 import asyncio
 import os
-import time
 import pip_system_certs.wrapt_requests  # trust Windows cert store (fixes Avast SSL-scan MITM)
 from pathlib import Path
 from dotenv import load_dotenv
@@ -17,10 +16,6 @@ from backend.services.widgetgen import generate_widget
 from backend.services.videogen import generate_video, NeedsProPlanError, VIDEO_DIR
 from backend.services.quizgen import generate_quiz, generate_check_question
 from backend.services.summarygen import generate_summary
-from backend.services.explain import explain_deep
-from backend.services.intent import match_level_intent
-from backend.services.tts import speak_level, AUDIO_DIR
-from backend.services.transcribe import RealtimeTranscriber
 
 ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
 
@@ -29,31 +24,14 @@ app = FastAPI()
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR, html=True), name="static")
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
-app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
-FAST_MODE_MAX_ATTEMPTS = 3  # the fast empty-map cadence is capped by attempts,
-# not by "does the map have nodes yet": an extraction that legitimately returns
-# nothing (30s of "so, um, let's get started") would otherwise leave the loop in
-# 3s mode indefinitely, which is precisely the runaway-quota case.
-FIRST_EXTRACTION_SECONDS = 3  # while the map is still empty, poll this often so
-# the first cards are on screen inside the first ~10s of a demo instead of at
-# the end of the first full 20s cycle.
-FIRST_EXTRACTION_MIN_CHARS = 90  # ...but only once there's actually a couple of
-# sentences to extract from, otherwise the first call burns quota on "So,".
-EXTRACTION_INTERVAL_SECONDS = 12  # ~5 calls/min: stays well under Gemini free-tier's
+EXTRACTION_INTERVAL_SECONDS = 20  # ~3 calls/min: stays well under Gemini free-tier's
 # ~10 RPM cap, and under a ~2hr live lecture keeps total calls within the free
 # tier's daily request budget (reportedly as low as ~250/day for flash models
 # on the free tier as of late-2025 quota cuts).
-MIN_SECONDS_BETWEEN_CALLS = 7  # hard floor between two Gemini extractions, honoured
-# even by the fast empty-map cadence and by an explicit "generate now" click. The
-# tick interval alone can't bound the call rate: the transcript mutates on every
-# partial, so a 3s tick means a call every 3s (~20/min) against a ~10 RPM cap.
-MIN_NEW_CHARS = 80  # ...and the transcript has to have actually moved on. Without
-# this, one more word in a mutating partial reads as "new" and buys a full call.
-BACKOFF_START_SECONDS = 15  # after an error (e.g. rate-limited), wait this long,
-BACKOFF_MAX_SECONDS = 90    # doubling up to here, before trying again - in real
-# seconds, not in ticks, so a fast empty-map cadence can't shrink the backoff to
-# nothing at exactly the moment the API is asking to be left alone.
+MAX_BACKOFF_SKIPS = 6  # after an error (e.g. rate-limited), wait up to 6 extra
+# cycles (~2 more minutes) before trying again, instead of hammering an API
+# that's already saying no.
 
 
 def _find_node(graph: dict, node_id: str) -> dict | None:
@@ -67,12 +45,7 @@ def _find_node(graph: dict, node_id: str) -> dict | None:
 async def lecture_ws(ws: WebSocket):
     await ws.accept()
     state = {
-        "transcript": "",  # speech, owned by the server when ElevenLabs is transcribing
-        # the segment ElevenLabs hasn't committed yet. It still feeds
-        # extraction: waiting for the commit is what used to make the map lag
-        # a whole sentence behind the lecturer.
-        "partial": "",
-        "manual": "",      # whatever is typed/pasted in the frontend's text box
+        "transcript": "",
         "last_extracted": "",
         "graph": {"nodes": [], "edges": []},
         # Everything here runs as blocking synchronous Gemini calls on one
@@ -87,94 +60,8 @@ async def lecture_ws(ws: WebSocket):
         # made during "listening" doesn't get queued behind a fresh 20s
         # extraction that was about to start anyway.
         "busy": False,
-        # live ElevenLabs Scribe session, created lazily on the first audio
-        # chunk so a listener who never turns the mic on costs nothing.
-        "stt": None,
-        # this machine's .env key, or one the listener pasted into the UI on a
-        # laptop that has no .env at all.
-        "api_key": ELEVENLABS_API_KEY,
-        # the card the student is looking at - the target of spoken level
-        # commands ("explain that simpler").
-        "selected_node_id": None,
     }
     force_event = asyncio.Event()
-    last_partial_trace = 0.0
-
-    def trace_partial(text: str) -> None:
-        """One line per ~2s: a partial arrives several times a second and the
-        log has to stay readable next to the extraction traces."""
-        nonlocal last_partial_trace
-        now = time.monotonic()
-        if now - last_partial_trace >= 2.0:
-            last_partial_trace = now
-            print(f"[TRACE] partial forwarded ({len(text)} chars)", flush=True)
-
-    async def send_stt_status():
-        await ws.send_json({
-            "type": "stt_status",
-            "provider": "elevenlabs",
-            "has_key": bool(state["api_key"]),
-            "from_server": bool(ELEVENLABS_API_KEY),
-        })
-
-    await send_stt_status()
-
-    async def on_partial(text: str):
-        # display path: straight to the browser, no timer, no batching. It
-        # also feeds extraction as the uncommitted tail (state["partial"]),
-        # which is replaced wholesale each time - a partial is a revision,
-        # so it never accumulates in the buffer.
-        state["partial"] = text or ""
-        trace_partial(state["partial"])
-        await ws.send_json({
-            "type": "partial_transcript", "text": text, "final": False,
-        })
-
-    async def on_committed(text: str):
-        # the segment always goes into the transcript first, command or not:
-        # a trigger phrase must never silently disappear from what feeds
-        # concept extraction.
-        state["transcript"] = (state["transcript"] + " " + text).strip()
-        state["partial"] = ""
-        print(f"[TRACE] final appended to buffer ({len(text)} chars)", flush=True)
-        await ws.send_json({
-            "type": "transcript", "text": state["transcript"],
-            "committed": text, "final": True,
-        })
-
-        level = match_level_intent(text)
-        if level and state["selected_node_id"]:
-            await ws.send_json({
-                "type": "level_intent", "node_id": state["selected_node_id"],
-                "level": level, "phrase": text.strip(),
-            })
-
-    async def on_stt_error(message: str):
-        await ws.send_json({"type": "error", "context": "transcribe", "message": message})
-
-    async def stop_transcriber(commit: bool):
-        transcriber = state["stt"]
-        state["stt"] = None
-        if not transcriber:
-            return
-        try:
-            if commit:
-                await transcriber.commit()
-                # give ElevenLabs a beat to emit the final committed segment
-                # before tearing the socket down, otherwise the last sentence
-                # spoken before "Stop" is silently lost.
-                await asyncio.sleep(1.0)
-        except Exception:
-            pass
-        await transcriber.close()
-
-    def store_deep(node: dict, result: tuple[str, bool]) -> dict:
-        """Kept on the node itself so extract_flowchart's merge (which re-emits
-        an existing node verbatim) carries the level-3 text forward instead of
-        dropping it on the next extraction cycle."""
-        text, cached = result
-        node["deep"] = text
-        return {"type": "deep", "node_id": node["id"], "text": text, "cached": cached}
 
     async def handle_node_action(msg: dict, context: str, run, ok_payload):
         """Shared per-node action pattern (ask / generate_image /
@@ -219,7 +106,7 @@ async def lecture_ws(ws: WebSocket):
                 "message": "unknown node for generate_video",
             })
             return
-        if not state["api_key"]:
+        if not ELEVENLABS_API_KEY:
             await ws.send_json({
                 "type": "error", "node_id": node["id"], "context": "generate_video",
                 "message": "No ElevenLabs API key configured.",
@@ -227,7 +114,7 @@ async def lecture_ws(ws: WebSocket):
             return
         try:
             filename, cached = await generate_video(
-                node["label"], node.get("definition", ""), state["api_key"], force=msg.get("force", False)
+                node["label"], node.get("definition", ""), ELEVENLABS_API_KEY, force=msg.get("force", False)
             )
             await ws.send_json({
                 "type": "video", "node_id": node["id"], "video_url": f"/videos/{filename}", "cached": cached,
@@ -241,40 +128,6 @@ async def lecture_ws(ws: WebSocket):
             await ws.send_json({
                 "type": "error", "node_id": node["id"], "context": "generate_video",
                 "message": f"video generation failed: {str(e)[:200]}",
-            })
-
-    async def handle_speak_level(msg: dict):
-        """Like video, this runs as its own task on real async I/O rather than
-        blocking the loop - the lecture keeps being transcribed and extracted
-        while a level is being voiced. The text is taken from the node
-        server-side, so the browser never needs the API key."""
-        level = int(msg.get("level") or 2)
-        node = _find_node(state["graph"], msg.get("node_id"))
-        if not node:
-            await ws.send_json({
-                "type": "error", "node_id": msg.get("node_id"), "context": "speak_level",
-                "message": "unknown node for speak_level",
-            })
-            return
-        text = {1: node.get("analogy"), 3: node.get("deep")}.get(level) or node.get("definition") or node["label"]
-        if not state["api_key"]:
-            await ws.send_json({
-                "type": "error", "node_id": node["id"], "context": "speak_level",
-                "message": "No ElevenLabs API key configured.",
-            })
-            return
-        try:
-            filename, cached = await speak_level(
-                node["label"], level, text, state["api_key"], force=msg.get("force", False)
-            )
-            await ws.send_json({
-                "type": "audio", "node_id": node["id"], "level": level,
-                "audio_url": f"/audio/{filename}", "cached": cached,
-            })
-        except Exception as e:
-            await ws.send_json({
-                "type": "error", "node_id": node["id"], "context": "speak_level",
-                "message": f"speech generation failed: {str(e)[:200]}",
             })
 
     async def receive_loop():
@@ -303,22 +156,6 @@ async def lecture_ws(ws: WebSocket):
                 )
                 continue
 
-            if msg_type == "explain_deep":
-                await handle_node_action(
-                    msg, "explain_deep",
-                    run=lambda node: explain_deep(node["label"], node.get("definition", ""), force=msg.get("force", False)),
-                    ok_payload=store_deep,
-                )
-                continue
-
-            if msg_type == "select_node":
-                state["selected_node_id"] = msg.get("node_id")
-                continue
-
-            if msg_type == "speak_level":
-                asyncio.create_task(handle_speak_level(msg))
-                continue
-
             if msg_type == "generate_widget":
                 await handle_node_action(
                     msg, "generate_widget",
@@ -327,48 +164,6 @@ async def lecture_ws(ws: WebSocket):
                         "type": "widget", "node_id": node["id"], "html": result[0], "cached": result[1],
                     },
                 )
-                continue
-
-            if msg_type == "elevenlabs_key":
-                key = (msg.get("key") or "").strip()
-                if key != state["api_key"]:
-                    await stop_transcriber(commit=False)  # next chunk reopens with the new key
-                    state["api_key"] = key or ELEVENLABS_API_KEY
-                await send_stt_status()
-                continue
-
-            if msg_type == "audio_chunk":
-                if not state["api_key"]:
-                    await ws.send_json({
-                        "type": "error", "context": "no_key",
-                        "message": "No ElevenLabs API key on this machine - paste one to transcribe.",
-                    })
-                    continue
-                if state["stt"] is None:
-                    try:
-                        transcriber = RealtimeTranscriber(
-                            state["api_key"], on_partial, on_committed, on_stt_error
-                        )
-                        await transcriber.start()
-                        state["stt"] = transcriber
-                    except Exception as e:
-                        await ws.send_json({
-                            "type": "error", "context": "transcribe",
-                            "message": f"could not start ElevenLabs transcription: {str(e)[:200]}",
-                        })
-                        continue
-                try:
-                    await state["stt"].send_audio(msg.get("audio_base_64", ""))
-                except Exception as e:
-                    await stop_transcriber(commit=False)
-                    await ws.send_json({
-                        "type": "error", "context": "transcribe",
-                        "message": f"transcription stream dropped: {str(e)[:200]}",
-                    })
-                continue
-
-            if msg_type == "audio_stop":
-                await stop_transcriber(commit=True)
                 continue
 
             if msg_type == "generate_video":
@@ -407,46 +202,14 @@ async def lecture_ws(ws: WebSocket):
                     state["busy"] = False
                 continue
 
-            if msg_type == "speech_segment":
-                # Chrome's own Web Speech engine transcribes in the browser and
-                # posts each final segment here, so it lands in exactly the same
-                # place (and runs the same level-intent regex) as an ElevenLabs
-                # committed segment.
-                text = (msg.get("text") or "").strip()
-                if text:
-                    await on_committed(text)
-                continue
-
-            if msg_type == "speech_partial":
-                # interim words feed extraction immediately instead of waiting
-                # for Chrome to finalise the sentence.
-                await on_partial(msg.get("text") or "")
-                continue
-
-            if msg_type == "manual_text":
-                # kept separate from the speech transcript: with ElevenLabs the
-                # server owns `transcript`, so letting the text box overwrite it
-                # would wipe everything already transcribed.
-                state["manual"] = msg.get("text", "")
-                if msg.get("force"):
-                    force_event.set()
-                continue
-
-            # default: bare `{text}` transcript update, for scripts/tests that
-            # push a transcript straight in without going through the mic
+            # default: transcript update (existing behavior, no explicit type needed)
             state["transcript"] = msg.get("text", state["transcript"])
             if msg.get("force"):
                 force_event.set()
 
-    async def run_extraction(transcript: str, stable: str) -> bool:
-        """`transcript` is what Gemini sees (partial included, so the map reacts
-        mid-sentence); `stable` is only the committed + typed text, and is what
-        the "has anything new been said?" gate measures against. Keying that gate
-        on the partial would compare against text that rewrites itself on every
-        interim result, so it would never fire while anyone is speaking.
-
-        Returns True on success, False on error (caller uses this to back off)."""
-        state["last_extracted"] = stable
+    async def run_extraction(transcript: str) -> bool:
+        """Returns True on success, False on error (caller uses this to back off)."""
+        state["last_extracted"] = transcript
         try:
             graph = extract_flowchart(transcript, state["graph"])
         except Exception as e:
@@ -460,79 +223,38 @@ async def lecture_ws(ws: WebSocket):
         return True
 
     async def extraction_loop():
-        # Every gate below is in wall-clock seconds rather than in loop ticks.
-        # The tick rate changes (3s while the map is empty, 20s after) and the
-        # transcript mutates continuously while anyone is speaking, so a gate
-        # counted in ticks silently becomes 6x tighter in exactly the situation
-        # it exists to protect: an empty map, a talking lecturer, and an API
-        # that is already rate-limiting us.
-        last_call_at = 0.0
-        backoff_until = 0.0
-        backoff_seconds = BACKOFF_START_SECONDS
-        fast_attempts = 0
+        backoff_skips_remaining = 0
         while True:
-            # An empty map is the one moment where latency is worth an extra
-            # call: tick fast for the first few attempts, then settle into the
-            # quota-friendly cadence whether or not those attempts found nodes.
-            first_pass = (
-                fast_attempts < FAST_MODE_MAX_ATTEMPTS
-                and not state["graph"].get("nodes")
-            )
-            interval = FIRST_EXTRACTION_SECONDS if first_pass else EXTRACTION_INTERVAL_SECONDS
             forced = False
             try:
-                await asyncio.wait_for(force_event.wait(), timeout=interval)
+                await asyncio.wait_for(force_event.wait(), timeout=EXTRACTION_INTERVAL_SECONDS)
                 forced = True
             except asyncio.TimeoutError:
                 pass
             force_event.clear()
 
-            # the uncommitted tail counts: the student is mid-sentence and the
-            # map should already be reacting to it.
-            stable = " ".join(
-                p for p in (state["transcript"], state["manual"]) if p
-            ).strip()
-            transcript = " ".join(
-                p for p in (state["transcript"], state["partial"], state["manual"]) if p
-            ).strip()
+            transcript = state["transcript"]
             if not transcript:
                 continue
 
-            if first_pass and not forced and len(transcript) < FIRST_EXTRACTION_MIN_CHARS:
-                continue
-
-            if state["busy"]:
+            if state["busy"] and not forced:
                 continue  # a user action (ask/image/widget) is running - don't queue behind it
 
-            now = time.monotonic()
-            if now < backoff_until:
-                continue  # the API said no recently; a click can't override that
-
-            # the floor applies to forced calls too - "generate now" clicked five
-            # times in a row is exactly how the quota gets spent in one second.
-            if now - last_call_at < MIN_SECONDS_BETWEEN_CALLS:
+            if backoff_skips_remaining > 0 and not forced:
+                backoff_skips_remaining -= 1
                 continue
 
-            if not forced and len(stable) - len(state["last_extracted"]) < MIN_NEW_CHARS:
-                continue  # not enough new *committed* speech to be worth a call
+            if not forced and transcript == state["last_extracted"]:
+                continue  # nothing new since last pass, skip the Gemini call
 
-            last_call_at = now
-            if first_pass:
-                fast_attempts += 1
             state["busy"] = True
             try:
-                ok = await run_extraction(transcript, stable)
+                ok = await run_extraction(transcript)
             finally:
                 state["busy"] = False
-            if ok:
-                backoff_seconds = BACKOFF_START_SECONDS
-            else:
-                backoff_until = time.monotonic() + backoff_seconds
-                backoff_seconds = min(backoff_seconds * 2, BACKOFF_MAX_SECONDS)
+            backoff_skips_remaining = 0 if ok else MAX_BACKOFF_SKIPS
 
     try:
         await asyncio.gather(receive_loop(), extraction_loop())
     except WebSocketDisconnect:
         pass
-    finally:
-        await stop_transcriber(commit=False)

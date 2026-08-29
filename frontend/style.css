@@ -60,29 +60,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .panel-box label { display: block; color: var(--muted); margin-bottom: 0.2rem; font-size: 0.72rem; }
 #transcript { max-height: 60px; overflow-y: auto; white-space: pre-wrap; color: var(--muted); }
-/* words ElevenLabs hasn't committed yet: visibly "still being written" */
-.transcript-partial { opacity: 0.55; font-style: italic; }
-.transcript-partial::after {
-  content: "▌"; margin-left: 1px; font-style: normal;
-  animation: caret-blink 1s steps(1) infinite;
-}
-@keyframes caret-blink { 50% { opacity: 0; } }
 #manualInput {
   width: 100%; min-height: 42px; font-family: inherit; font-size: 0.78rem;
   border-radius: 6px; border: 1px solid var(--border); padding: 0.3rem 0.5rem;
   resize: vertical; background: var(--panel); color: var(--text);
-}
-
-.key-box {
-  border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.6rem;
-  background: var(--bg); font-size: 0.78rem; margin-bottom: 0.4rem;
-}
-.key-box label { display: block; color: var(--muted); margin-bottom: 0.25rem; font-size: 0.72rem; }
-.key-row { display: flex; gap: 0.4rem; }
-.key-row input {
-  flex: 1; max-width: 380px; font-family: inherit; font-size: 0.78rem;
-  border-radius: 6px; border: 1px solid var(--border); padding: 0.3rem 0.5rem;
-  background: var(--panel); color: var(--text);
 }
 
 /* ---------- layout: canvas (left) + panel (right) ---------- */
@@ -100,11 +81,8 @@ button:disabled { opacity: 0.5; cursor: default; }
   transform-origin: 0 0;
 }
 #edgeLayer { position: absolute; overflow: visible; pointer-events: none; }
-.edge-path { fill: none; }
-.edge-path.edge-tree { stroke: var(--accent); stroke-opacity: 0.55; stroke-width: 2.2; }
-.edge-path.edge-crosslink { stroke: var(--muted); stroke-opacity: 0.4; stroke-width: 1.4; stroke-dasharray: 4 4; }
-.edge-label-bg { fill: var(--panel); opacity: 0.92; rx: 4; ry: 4; }
-.edge-label-text { fill: var(--text); font-size: 10.5px; font-weight: 600; }
+#edgeLayer line { stroke: var(--muted); stroke-width: 2; marker-end: url(#arrowhead); }
+#edgeLayer text { fill: var(--muted); font-size: 11px; }
 
 .placeholder-hint {
   position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
@@ -113,12 +91,10 @@ button:disabled { opacity: 0.5; cursor: default; }
 
 /* ---------- cards ---------- */
 .card {
-  position: absolute; left: 0; top: 0;
-  width: var(--w, 190px); height: var(--h, 110px);
-  margin-left: calc(var(--w, 190px) / -2); margin-top: calc(var(--h, 110px) / -2);
+  position: absolute; left: 0; top: 0; width: 190px; height: 110px;
+  margin-left: -95px; margin-top: -55px;
   perspective: 900px;
-  opacity: 1;
-  transition: opacity 0.5s ease, width 0.45s ease, height 0.45s ease, margin 0.45s ease;
+  opacity: 1; transition: opacity 0.5s ease;
 }
 .card.entering { opacity: 0; }
 .card-inner {
@@ -142,11 +118,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   letter-spacing: 0.03em; color: white; background: var(--card-color, #888);
   border-radius: 4px; padding: 0.08rem 0.4rem; margin-bottom: 0.3rem; width: fit-content;
 }
-.card-badge-icon { margin-right: 0.3rem; font-weight: 800; }
-.shape-diamond .card-face { border-radius: 6px; border-width: 2px; border-style: double; }
-.shape-hexagon .card-face { border-radius: 4px 18px 4px 18px; }
-.card.important .card-face { border-width: 3px; box-shadow: 0 4px 14px rgba(0,0,0,0.25); }
-.card-label { font-weight: 700; font-size: calc(0.92rem * var(--scale, 1)); line-height: 1.2; }
+.card-label { font-weight: 700; font-size: 0.92rem; line-height: 1.2; }
 .card-hint { margin-top: auto; font-size: 0.68rem; color: var(--muted); }
 .card.selected .card-face { box-shadow: 0 0 0 3px var(--accent); }
 
@@ -166,9 +138,9 @@ button:disabled { opacity: 0.5; cursor: default; }
 .image-slot { margin-bottom: 0.3rem; }
 .image-slot img { max-width: 100%; border-radius: 8px; display: block; }
 
-/* Touch-device card sizing is handled in app.js (BASE_CARD_W/H bump via
-   isCoarsePointer), which feeds the --w/--h vars above - no separate
-   override needed here. */
+@media (pointer: coarse) {
+  .card { width: 220px; height: 130px; margin-left: -110px; margin-top: -65px; }
+}
 
 /* ---------- right panel: the real interaction surface ---------- */
 #panel {
@@ -184,21 +156,6 @@ button:disabled { opacity: 0.5; cursor: default; }
   padding: 0.55rem 0.8rem; border-radius: 0 8px 8px 0; margin: 0 0 0.8rem;
 }
 .panel-definition { font-size: 0.95rem; line-height: 1.45; color: var(--text); margin: 0 0 0.8rem; }
-.level-select { font-size: 0.78rem; color: var(--muted); display: flex; align-items: center; gap: 0.3rem; }
-.level-select select {
-  font-family: inherit; font-size: 0.78rem; border-radius: 6px;
-  border: 1px solid var(--border); background: var(--panel); color: var(--text);
-  padding: 0.25rem 0.35rem;
-}
-.level-tabs { display: flex; gap: 0.3rem; margin: 0 0 0.7rem; }
-.level-tab {
-  flex: 1; font-size: 0.78rem; padding: 0.3rem 0.4rem; border-radius: 6px;
-  border: 1px solid var(--border); background: var(--bg); color: var(--muted); cursor: pointer;
-}
-.level-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
-.speak-btn { font-size: 0.8rem; padding: 0.3rem 0.6rem; }
-.level-audio { width: 100%; height: 34px; margin: 0 0 0.6rem; }
-
 .panel-section { margin: 1.1rem 0; padding-top: 1.1rem; border-top: 1px solid var(--border); }
 .panel-section h3 { margin: 0 0 0.5rem; font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
 

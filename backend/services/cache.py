@@ -24,9 +24,6 @@ def _slug(label: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_") or "unnamed"
 
 
-slug = _slug  # public alias for services that key FILES (audio, video) by concept
-
-
 def _cache_path(cache_name: str) -> Path:
     return CACHE_DIR / f"{cache_name}_cache.json"
 
