@@ -1124,8 +1124,20 @@ function sendManualText(force = false) {
   ws.send(JSON.stringify({ type: "manual_text", text: manualInput.value, force }));
 }
 
+// The uncommitted tail is shown greyed-out with a caret, so you can see the
+// words arriving live (they already feed extraction server-side) and see the
+// moment ElevenLabs firms them up.
 function renderTranscript() {
-  transcriptEl.textContent = (fullTranscript + (partialTranscript ? " " + partialTranscript : "")).trim();
+  transcriptEl.textContent = "";
+  const committed = document.createElement("span");
+  committed.textContent = fullTranscript;
+  transcriptEl.appendChild(committed);
+  if (partialTranscript) {
+    const partial = document.createElement("span");
+    partial.className = "transcript-partial";
+    partial.textContent = (fullTranscript ? " " : "") + partialTranscript;
+    transcriptEl.appendChild(partial);
+  }
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 

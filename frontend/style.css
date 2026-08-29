@@ -60,6 +60,13 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .panel-box label { display: block; color: var(--muted); margin-bottom: 0.2rem; font-size: 0.72rem; }
 #transcript { max-height: 60px; overflow-y: auto; white-space: pre-wrap; color: var(--muted); }
+/* words ElevenLabs hasn't committed yet: visibly "still being written" */
+.transcript-partial { opacity: 0.55; font-style: italic; }
+.transcript-partial::after {
+  content: "▌"; margin-left: 1px; font-style: normal;
+  animation: caret-blink 1s steps(1) infinite;
+}
+@keyframes caret-blink { 50% { opacity: 0; } }
 #manualInput {
   width: 100%; min-height: 42px; font-family: inherit; font-size: 0.78rem;
   border-radius: 6px; border: 1px solid var(--border); padding: 0.3rem 0.5rem;

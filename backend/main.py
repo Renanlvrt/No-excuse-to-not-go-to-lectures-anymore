@@ -30,6 +30,11 @@ app.mount("/static", StaticFiles(directory=FRONTEND_DIR, html=True), name="stati
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
+FIRST_EXTRACTION_SECONDS = 3  # while the map is still empty, poll this often so
+# the first cards are on screen inside the first ~10s of a demo instead of at
+# the end of the first full 20s cycle.
+FIRST_EXTRACTION_MIN_CHARS = 120  # ...but only once there's actually a couple of
+# sentences to extract from, otherwise the first call burns quota on "So,".
 EXTRACTION_INTERVAL_SECONDS = 20  # ~3 calls/min: stays well under Gemini free-tier's
 # ~10 RPM cap, and under a ~2hr live lecture keeps total calls within the free
 # tier's daily request budget (reportedly as low as ~250/day for flash models
@@ -51,6 +56,10 @@ async def lecture_ws(ws: WebSocket):
     await ws.accept()
     state = {
         "transcript": "",  # speech, owned by the server when ElevenLabs is transcribing
+        # the segment ElevenLabs hasn't committed yet. It still feeds
+        # extraction: waiting for the commit is what used to make the map lag
+        # a whole sentence behind the lecturer.
+        "partial": "",
         "manual": "",      # whatever is typed/pasted in the frontend's text box
         "last_extracted": "",
         "graph": {"nodes": [], "edges": []},
@@ -89,6 +98,7 @@ async def lecture_ws(ws: WebSocket):
     await send_stt_status()
 
     async def on_partial(text: str):
+        state["partial"] = text or ""
         await ws.send_json({"type": "partial_transcript", "text": text})
 
     async def on_committed(text: str):
@@ -96,6 +106,7 @@ async def lecture_ws(ws: WebSocket):
         # a trigger phrase must never silently disappear from what feeds
         # concept extraction.
         state["transcript"] = (state["transcript"] + " " + text).strip()
+        state["partial"] = ""
         await ws.send_json({"type": "transcript", "text": state["transcript"], "committed": text})
 
         level = match_level_intent(text)
@@ -396,16 +407,28 @@ async def lecture_ws(ws: WebSocket):
     async def extraction_loop():
         backoff_skips_remaining = 0
         while True:
+            # An empty map is the one moment where latency is worth an extra
+            # call: poll fast until the first cards exist, then settle into the
+            # quota-friendly 20s cadence.
+            first_pass = not state["graph"].get("nodes")
+            interval = FIRST_EXTRACTION_SECONDS if first_pass else EXTRACTION_INTERVAL_SECONDS
             forced = False
             try:
-                await asyncio.wait_for(force_event.wait(), timeout=EXTRACTION_INTERVAL_SECONDS)
+                await asyncio.wait_for(force_event.wait(), timeout=interval)
                 forced = True
             except asyncio.TimeoutError:
                 pass
             force_event.clear()
 
-            transcript = (state["transcript"] + " " + state["manual"]).strip()
+            # the uncommitted tail counts: the student is mid-sentence and the
+            # map should already be reacting to it.
+            transcript = " ".join(
+                p for p in (state["transcript"], state["partial"], state["manual"]) if p
+            ).strip()
             if not transcript:
+                continue
+
+            if first_pass and not forced and len(transcript) < FIRST_EXTRACTION_MIN_CHARS:
                 continue
 
             if state["busy"] and not forced:
