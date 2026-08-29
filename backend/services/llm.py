@@ -1,0 +1,48 @@
+"""Shared Gemini call helper.
+
+Different Gemini model names draw from SEPARATE free-tier quota pools (learned
+the hard way mid-demo: gemini-3.6-flash ran out, lite/latest variants didn't).
+Every text-generating feature (diagram extraction, Q&A) goes through this so
+they all get the same automatic fallback instead of each reimplementing it.
+"""
+import os
+import google.generativeai as genai
+
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"), transport="rest")
+
+MODEL_FALLBACK_CHAIN = [
+    "gemini-flash-lite-latest",
+    "gemini-flash-latest",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+]
+
+_model_cache = {}
+_working_model_index = 0  # sticky: once one works, start there next time
+
+
+def _get_model(name: str, system_instruction: str):
+    key = (name, system_instruction)
+    if key not in _model_cache:
+        _model_cache[key] = genai.GenerativeModel(name, system_instruction=system_instruction)
+    return _model_cache[key]
+
+
+def generate_with_fallback(prompt: str, system_instruction: str, timeout: int = 15, json_mode: bool = False) -> str:
+    global _working_model_index
+    last_error = None
+    gen_config = genai.GenerationConfig(response_mime_type="application/json") if json_mode else None
+    order = list(range(_working_model_index, len(MODEL_FALLBACK_CHAIN))) + list(range(_working_model_index))
+    for i in order:
+        name = MODEL_FALLBACK_CHAIN[i]
+        try:
+            model = _get_model(name, system_instruction)
+            response = model.generate_content(
+                prompt, request_options={"timeout": timeout}, generation_config=gen_config
+            )
+        except Exception as e:
+            last_error = e
+            continue
+        _working_model_index = i
+        return response.text or ""
+    raise last_error

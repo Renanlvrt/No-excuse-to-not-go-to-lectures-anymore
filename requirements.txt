@@ -1,0 +1,12 @@
+pip-system-certs
+fastapi
+uvicorn[standard]
+websockets
+python-multipart
+requests
+elevenlabs
+google-generativeai
+tavily-python
+python-dotenv
+httpx
+truststore
