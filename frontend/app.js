@@ -71,17 +71,23 @@ function wsReady() {
   return false;
 }
 
-// ---------- category colors ----------
-const CATEGORY_COLORS = {
-  math: "#5b8def", code: "#8a5cf6", process: "#f5a623", theory: "#2fb380",
-  warning: "#e5484d", definition: "#6b7280", interactive: "#00acc1",
+// ---------- category visual language: color + shape + icon accent ----------
+const CATEGORY_STYLES = {
+  math:        { color: "#5b8def", icon: "Σ", shape: "diamond" },
+  code:        { color: "#8a5cf6", icon: "</>", shape: "hexagon" },
+  process:     { color: "#f5a623", icon: "→", shape: "hexagon" },
+  theory:      { color: "#2fb380", icon: "◎", shape: "rounded" },
+  warning:     { color: "#e5484d", icon: "!", shape: "diamond" },
+  definition:  { color: "#6b7280", icon: "§", shape: "rounded" },
+  interactive: { color: "#00acc1", icon: "⚙", shape: "hexagon" },
 };
-function colorForCategory(cat) {
-  if (CATEGORY_COLORS[cat]) return CATEGORY_COLORS[cat];
+function styleForCategory(cat) {
+  if (CATEGORY_STYLES[cat]) return CATEGORY_STYLES[cat];
   let hash = 0;
   for (const ch of String(cat || "default")) hash = (hash * 31 + ch.charCodeAt(0)) % 360;
-  return `hsl(${hash}, 62%, 55%)`;
+  return { color: `hsl(${hash}, 62%, 55%)`, icon: "●", shape: "rounded" };
 }
+function colorForCategory(cat) { return styleForCategory(cat).color; }
 
 // ---------- node/graph state ----------
 // nodeState[id] doubles as the d3 simulation's node object (x/y/vx/vy live
@@ -91,46 +97,160 @@ window.nodeState = nodeState; // exposed for automated verification (see SUCCESS
 const nodesArr = [];
 let linksArr = [];
 const cardEls = {};   // id -> card DOM element
-const edgeEls = {};   // "from|to" -> {line, label}
+const edgeEls = {};   // "from|to" -> {path, labelBg, labelEl, hasLabel}
 
-const CARD_W = 190, CARD_H = 110;
+const isCoarsePointer = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+const BASE_CARD_W = isCoarsePointer ? 220 : 190, BASE_CARD_H = isCoarsePointer ? 130 : 110;
 
-// ---------- d3-force simulation ----------
-function rectCollideForce() {
-  let nodes;
-  function force() {
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const a = nodes[i], b = nodes[j];
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const overlapX = CARD_W - Math.abs(dx);
-        const overlapY = CARD_H - Math.abs(dy);
-        if (overlapX > 0 && overlapY > 0) {
-          if (overlapX < overlapY) {
-            const push = overlapX / 2 * (dx >= 0 ? 1 : -1) || 1;
-            a.vx -= push; b.vx += push;
-          } else {
-            const push = overlapY / 2 * (dy >= 0 ? 1 : -1) || 1;
-            a.vy -= push; b.vy += push;
-          }
-        }
+// ============================================================
+// Semantic Knowledge Map layout: hierarchy (from the LLM's own
+// parent -> child edges) decides WHERE everything goes; d3-force below is
+// only a lightweight smoother + spacing/collision pass on top of that, not
+// the layout algorithm itself.
+// ============================================================
+
+// ---------- 1. hierarchy: depth (ring) + primary parent (wedge nesting) ----
+// BFS from every "root" (no incoming edge) simultaneously, so a node's depth
+// is its shortest hierarchical distance from any root. Depth 1 = "major
+// concepts" ring around the implied lecture center; deeper rings = their
+// sub-concepts. Naturally cycle-safe (BFS never revisits a node) and
+// degrades gracefully to "everything is a root" before any edges exist yet.
+function computeHierarchy(nodes, links) {
+  const inDegree = {}, outDegree = {}, adj = {};
+  for (const n of nodes) { inDegree[n.id] = 0; outDegree[n.id] = 0; }
+  for (const l of links) {
+    const from = typeof l.source === "object" ? l.source.id : l.source;
+    const to = typeof l.target === "object" ? l.target.id : l.target;
+    if (!(from in inDegree) || !(to in inDegree)) continue;
+    inDegree[to]++; outDegree[from]++;
+    (adj[from] = adj[from] || []).push(to);
+  }
+
+  const depth = {}, primaryParentOf = {}, childrenOf = {};
+  const roots = nodes.filter((n) => inDegree[n.id] === 0);
+  const queue = [];
+  for (const r of roots) { depth[r.id] = 1; queue.push(r.id); }
+  let qi = 0;
+  while (qi < queue.length) {
+    const id = queue[qi++];
+    for (const childId of adj[id] || []) {
+      if (!(childId in depth)) {
+        depth[childId] = depth[id] + 1;
+        primaryParentOf[childId] = id;
+        (childrenOf[id] = childrenOf[id] || []).push(childId);
+        queue.push(childId);
       }
     }
   }
-  force.initialize = (n) => { nodes = n; };
-  return force;
+  // A node BFS never reached is part of a pure cycle with no entry point
+  // (e.g. A->B->A, both have inDegree 1) - vanishingly rare from the LLM's
+  // output, but treat it as its own root rather than crash/hang.
+  for (const n of nodes) {
+    if (!(n.id in depth)) { depth[n.id] = 1; roots.push(n); }
+  }
+
+  return { depth, primaryParentOf, childrenOf, inDegree, outDegree, roots };
 }
 
-// Tuned tighter than the initial defaults: the graph was spreading out
-// with large dead gaps between clusters, forcing zoom-out far enough that
-// labels became unreadable at scale (direct feedback). Less repulsion +
-// shorter links + a stronger center pull keeps it compact without
-// reintroducing card overlap (rectCollide still guarantees that separately).
+// ---------- 2. importance: degree + depth-tier, mapped through a SQRT
+// scale (not linear) since it drives card AREA - matching standard
+// dataviz practice for size-encoded quantities. ----------
+function computeImportance(nodes, hier) {
+  const { inDegree, outDegree, depth } = hier;
+  let maxDegree = 1;
+  for (const n of nodes) maxDegree = Math.max(maxDegree, inDegree[n.id] + outDegree[n.id]);
+  const degreeScale = d3.scaleSqrt().domain([0, maxDegree]).range([0.85, 1.35]).clamp(true);
+  for (const n of nodes) {
+    const degree = inDegree[n.id] + outDegree[n.id];
+    const depthTierBoost = depth[n.id] === 1 ? 1.12 : depth[n.id] === 2 ? 1.0 : 0.92;
+    const scale = 0.7 * degreeScale(degree) + 0.3 * depthTierBoost;
+    n.importance = scale;
+    n.w = Math.round(BASE_CARD_W * scale);
+    n.h = Math.round(BASE_CARD_H * scale);
+    n.depth = depth[n.id];
+  }
+}
+
+// ---------- 3. angular layout: each node gets a wedge of the circle
+// proportional to its own + its descendants' footprint, subdivided
+// recursively (same idea as d3.tree()'s separation, hand-rolled radially).
+// Stable id-sort ordering means re-running this every ~20s keeps existing
+// nodes' wedges nearly unchanged - a new sibling narrows its neighbors a
+// little instead of reshuffling the whole ring. ----------
+function computeAngles(hier, sizeOf) {
+  const { childrenOf, roots } = hier;
+  const angle = {};
+  function subtreeWeight(id) {
+    let w = sizeOf(id);
+    for (const c of childrenOf[id] || []) w += subtreeWeight(c);
+    return w;
+  }
+  function assign(ids, startAngle, endAngle) {
+    const weights = ids.map(subtreeWeight);
+    const total = weights.reduce((a, b) => a + b, 0) || 1;
+    let a = startAngle;
+    ids.forEach((id, i) => {
+      const span = (endAngle - startAngle) * (weights[i] / total);
+      angle[id] = a + span / 2;
+      const kids = (childrenOf[id] || []).slice().sort();
+      if (kids.length) assign(kids, a, a + span);
+      a += span;
+    });
+  }
+  const rootIds = roots.map((r) => r.id).sort();
+  if (rootIds.length) assign(rootIds, 0, Math.PI * 2);
+  return angle;
+}
+
+// ---------- 4. ring radius per depth: grows to fit however many/large the
+// nodes at that depth actually are, instead of a fixed guess. ----------
+function computeRingRadii(nodes, hier) {
+  const { depth } = hier;
+  const maxDepth = nodes.length ? Math.max(...nodes.map((n) => depth[n.id])) : 1;
+  const perDepth = {};
+  for (const n of nodes) (perDepth[depth[n.id]] = perDepth[depth[n.id]] || []).push(n);
+  const radius = { 0: 0 };
+  const RING_GAP = 70;
+  for (let d = 1; d <= maxDepth; d++) {
+    const group = perDepth[d] || [];
+    const maxDim = group.length ? Math.max(...group.map((n) => Math.max(n.w, n.h))) : BASE_CARD_H;
+    const circumferenceNeeded = group.reduce((sum, n) => sum + n.w + 24, 0);
+    const minRadiusForSpacing = circumferenceNeeded / (Math.PI * 2);
+    radius[d] = Math.max(radius[d - 1] + maxDim / 2 + RING_GAP, minRadiusForSpacing, radius[d - 1] + 160);
+  }
+  return radius;
+}
+
+// ---------- 5. tie it together: compute every node's target anchor
+// (tx, ty). THIS is the layout algorithm - the force simulation below never
+// decides structure, only eases nodes toward these anchors and resolves
+// local spacing. ----------
+function applyHierarchyLayout() {
+  const hier = computeHierarchy(nodesArr, linksArr);
+  computeImportance(nodesArr, hier);
+  const angle = computeAngles(hier, (id) => nodeState[id].w);
+  const radius = computeRingRadii(nodesArr, hier);
+  for (const n of nodesArr) {
+    const r = radius[hier.depth[n.id]] ?? radius[1] ?? 200;
+    const a = angle[n.id] ?? 0;
+    n.tx = Math.cos(a - Math.PI / 2) * r;
+    n.ty = Math.sin(a - Math.PI / 2) * r;
+  }
+  return hier;
+}
+
+// ---------- 6. d3-force: lightweight smoothing + spacing ONLY. Weak charge
+// (just enough for organic local jitter, not global structure), forceX/Y
+// gently pull each node toward its hierarchy-computed anchor, and
+// forceCollide (sized to each card's real, importance-scaled footprint)
+// resolves overlap. Low alphaDecay + a mild reheat keeps existing nodes
+// drifting into a new layout rather than jumping. ----------
 const simulation = d3.forceSimulation([])
-  .force("charge", d3.forceManyBody().strength(-260))
-  .force("link", d3.forceLink([]).id((d) => d.id).distance(140))
-  .force("center", d3.forceCenter(0, 0).strength(0.06))
-  .force("rectCollide", rectCollideForce())
+  .force("x", d3.forceX((d) => d.tx).strength(0.12))
+  .force("y", d3.forceY((d) => d.ty).strength(0.12))
+  .force("charge", d3.forceManyBody().strength(-30))
+  .force("collide", d3.forceCollide((d) => Math.hypot(d.w, d.h) / 2 + 14).strength(0.9).iterations(3))
+  .alphaDecay(0.05)
   .on("tick", onTick);
 
 function onTick() {
@@ -141,25 +261,43 @@ function onTick() {
   drawEdges();
 }
 
+// ---------- edges: curved paths, bowed outward from the shared centroid so
+// they sweep around already-placed cards near the hub instead of cutting
+// straight through them; labels ride the curve's midpoint on their own
+// background pill so they stay legible over any card color. ----------
 function drawEdges() {
   for (const key in edgeEls) {
-    const { line, labelEl } = edgeEls[key];
+    const { path, labelBg, labelEl, hasLabel } = edgeEls[key];
     const [fromId, toId] = key.split("|");
     const a = nodeState[fromId], b = nodeState[toId];
     if (!a || !b) continue;
-    line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
-    line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
-    labelEl.setAttribute("x", (a.x + b.x) / 2);
-    labelEl.setAttribute("y", (a.y + b.y) / 2 - 4);
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const centerDist = Math.hypot(mx, my) || 1;
+    const outX = mx / centerDist, outY = my / centerDist;
+    const bow = 22 + Math.min(60, Math.hypot(b.x - a.x, b.y - a.y) * 0.12);
+    const cx = mx + outX * bow, cy = my + outY * bow;
+    path.setAttribute("d", `M${a.x},${a.y} Q${cx},${cy} ${b.x},${b.y}`);
+
+    if (hasLabel) {
+      labelEl.setAttribute("x", cx);
+      labelEl.setAttribute("y", cy);
+      try {
+        const bbox = labelEl.getBBox();
+        labelBg.setAttribute("x", bbox.x - 4);
+        labelBg.setAttribute("y", bbox.y - 2);
+        labelBg.setAttribute("width", bbox.width + 8);
+        labelBg.setAttribute("height", bbox.height + 4);
+      } catch (e) { /* getBBox can throw before first paint in some engines - skip a frame */ }
+    }
   }
 }
 
-// ---------- graph merge (never delete, reheat sim gently on new nodes) ----------
+// ---------- graph merge (never delete; hierarchy recomputed every update,
+// existing nodes drift gently rather than jump - see applyHierarchyLayout
+// and the gentle alpha reheat below). ----------
 function mergeGraph(data) {
-  const parentOf = {};
-  for (const e of data.edges || []) parentOf[e.to] = e.from;
-
   let addedAny = false;
+  const newlyAdded = [];
   for (const n of data.nodes || []) {
     if (nodeState[n.id]) {
       Object.assign(nodeState[n.id], {
@@ -167,18 +305,11 @@ function mergeGraph(data) {
         mode: n.mode, steps: n.steps || [],
       });
     } else {
-      const parentId = parentOf[n.id];
-      let x, y;
-      if (parentId && nodeState[parentId]) {
-        x = nodeState[parentId].x + (Math.random() - 0.5) * 40;
-        y = nodeState[parentId].y + 160 + (Math.random() - 0.5) * 40;
-      } else {
-        x = (Math.random() - 0.5) * 120;
-        y = (Math.random() - 0.5) * 120;
-      }
       const node = Object.assign(
         {
-          x, y, vx: 0, vy: 0, qa: [], image: null, widgetHtml: null,
+          x: 0, y: 0, vx: 0, vy: 0, tx: 0, ty: 0,
+          w: BASE_CARD_W, h: BASE_CARD_H, importance: 1, depth: 1,
+          qa: [], image: null, widgetHtml: null,
           isNew: true, playing: false, currentStep: -1, pausedAtStep: null,
           lastError: null,
           // Persisted (not just local DOM state) so a pending request
@@ -194,6 +325,7 @@ function mergeGraph(data) {
       );
       nodeState[n.id] = node;
       nodesArr.push(node);
+      newlyAdded.push(node);
       addedAny = true;
     }
   }
@@ -202,53 +334,101 @@ function mergeGraph(data) {
     .filter((e) => nodeState[e.from] && nodeState[e.to])
     .map((e) => ({ source: e.from, target: e.to, label: e.label }));
 
+  // Layout: recompute hierarchy/importance/anchors for the whole graph.
+  // Stable id-sorted angle assignment means existing nodes' anchors shift
+  // only a little (a new sibling narrows their wedge) - not a full reshuffle.
+  const hier = applyHierarchyLayout();
+
+  // Brand-new nodes start AT their primary parent's current on-screen
+  // position (or their own target anchor if root-level) so they visually
+  // grow outward from what's already there instead of popping in randomly.
+  for (const node of newlyAdded) {
+    const parent = nodeState[hier.primaryParentOf[node.id]];
+    node.x = parent ? parent.x : node.tx;
+    node.y = parent ? parent.y : node.ty;
+  }
+
   simulation.nodes(nodesArr);
-  simulation.force("link").links(linksArr);
-  if (addedAny) simulation.alpha(0.6).restart();
+  // Gentle reheat only: the graph should drift into its new layout, not
+  // jump - a hard restart every ~20s would fight "preserve existing
+  // positions where practical."
+  simulation.alpha(Math.max(simulation.alpha(), addedAny ? 0.35 : 0.15)).restart();
 
   renderAllCards();
-  renderEdgeElements();
+  renderEdgeElements(hier);
   if (nodesArr.length) placeholderHint.style.display = "none";
 }
 
-function renderEdgeElements() {
+// A link is a "tree" edge if it's how its target actually got placed in the
+// hierarchy (its primary parent); anything else - a second parent, a
+// same-rank cross-reference - is a "crosslink": still drawn, but visually
+// subordinate (thinner/dashed) so the primary structure stays legible.
+function edgeKind(hier, fromId, toId) {
+  return hier.primaryParentOf[toId] === fromId ? "tree" : "crosslink";
+}
+
+function renderEdgeElements(hier) {
   for (const e of linksArr) {
     const fromId = typeof e.source === "object" ? e.source.id : e.source;
     const toId = typeof e.target === "object" ? e.target.id : e.target;
     const key = `${fromId}|${toId}`;
     if (!edgeEls[key]) {
-      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      const labelBg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
       const labelEl = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      labelBg.setAttribute("class", "edge-label-bg");
+      labelEl.setAttribute("class", "edge-label-text");
       labelEl.setAttribute("text-anchor", "middle");
       labelEl.textContent = e.label || "";
-      edgeLayer.appendChild(line);
-      edgeLayer.appendChild(labelEl);
-      edgeEls[key] = { line, labelEl };
+      const hasLabel = !!e.label;
+      edgeLayer.appendChild(path);
+      if (hasLabel) { edgeLayer.appendChild(labelBg); edgeLayer.appendChild(labelEl); }
+      edgeEls[key] = { path, labelBg, labelEl, hasLabel };
     }
+    const kind = edgeKind(hier, fromId, toId);
+    edgeEls[key].path.setAttribute("class", `edge-path edge-${kind}`);
+    edgeEls[key].path.setAttribute("marker-end", kind === "tree" ? "url(#arrowhead)" : "url(#arrowhead-faint)");
   }
 }
 
-// ---------- card rendering (lightweight: label + tiny flip-back definition) ----------
+// ---------- card rendering: size/weight reflect computed importance
+// (bigger, bolder cards for hub/foundational concepts); category maps to a
+// color + icon + accent shape, not just a border color. ----------
+function applyCardSizing(card, node) {
+  card.style.setProperty("--w", node.w + "px");
+  card.style.setProperty("--h", node.h + "px");
+  card.style.setProperty("--scale", node.importance || 1);
+  card.classList.toggle("important", (node.importance || 1) >= 1.15);
+}
+
 function renderAllCards() {
   for (const id in nodeState) {
-    if (!cardEls[id]) createCard(nodeState[id]);
+    const node = nodeState[id];
+    if (!cardEls[id]) createCard(node);
+    else applyCardSizing(cardEls[id], node);
   }
 }
 
 function createCard(node) {
   const card = document.createElement("div");
-  card.className = "card entering";
+  const catStyle = styleForCategory(node.category);
+  card.className = `card entering shape-${catStyle.shape}`;
   card.dataset.nodeId = node.id;
+  applyCardSizing(card, node);
 
   const inner = document.createElement("div");
   inner.className = "card-inner";
 
   const front = document.createElement("div");
   front.className = "card-face card-front";
-  front.style.setProperty("--card-color", colorForCategory(node.category));
+  front.style.setProperty("--card-color", catStyle.color);
   const badge = document.createElement("div");
   badge.className = "card-badge";
-  badge.textContent = node.category || "concept";
+  const badgeIcon = document.createElement("span");
+  badgeIcon.className = "card-badge-icon";
+  badgeIcon.textContent = catStyle.icon;
+  badge.appendChild(badgeIcon);
+  badge.appendChild(document.createTextNode(node.category || "concept"));
   const label = document.createElement("div");
   label.className = "card-label";
   label.textContent = node.label; // textContent only - never innerHTML with LLM text
@@ -263,7 +443,7 @@ function createCard(node) {
 
   const back = document.createElement("div");
   back.className = "card-face card-back";
-  back.style.setProperty("--card-color", colorForCategory(node.category));
+  back.style.setProperty("--card-color", catStyle.color);
   const def = document.createElement("div");
   def.className = "card-definition";
   def.textContent = node.definition || node.label;
@@ -301,10 +481,11 @@ function renderPanel() {
     return;
   }
 
+  const catStyle = styleForCategory(node.category);
   const badge = document.createElement("div");
   badge.className = "card-badge";
-  badge.style.setProperty("--card-color", colorForCategory(node.category));
-  badge.textContent = node.category || "concept";
+  badge.style.setProperty("--card-color", catStyle.color);
+  badge.textContent = `${catStyle.icon} ${node.category || "concept"}`;
   panelEl.appendChild(badge);
 
   const title = document.createElement("h2");
@@ -1002,8 +1183,9 @@ function fitToView() {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (const id of ids) {
     const n = nodeState[id];
-    minX = Math.min(minX, n.x - CARD_W / 2); maxX = Math.max(maxX, n.x + CARD_W / 2);
-    minY = Math.min(minY, n.y - CARD_H / 2); maxY = Math.max(maxY, n.y + CARD_H / 2);
+    const w = n.w || BASE_CARD_W, h = n.h || BASE_CARD_H;
+    minX = Math.min(minX, n.x - w / 2); maxX = Math.max(maxX, n.x + w / 2);
+    minY = Math.min(minY, n.y - h / 2); maxY = Math.max(maxY, n.y + h / 2);
   }
   const graphW = maxX - minX, graphH = maxY - minY;
   const vw = viewport.clientWidth, vh = viewport.clientHeight;
