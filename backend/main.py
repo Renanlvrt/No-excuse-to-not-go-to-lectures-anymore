@@ -31,6 +31,10 @@ app.mount("/static", StaticFiles(directory=FRONTEND_DIR, html=True), name="stati
 app.mount("/videos", StaticFiles(directory=VIDEO_DIR), name="videos")
 app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 
+FAST_MODE_MAX_ATTEMPTS = 3  # the fast empty-map cadence is capped by attempts,
+# not by "does the map have nodes yet": an extraction that legitimately returns
+# nothing (30s of "so, um, let's get started") would otherwise leave the loop in
+# 3s mode indefinitely, which is precisely the runaway-quota case.
 FIRST_EXTRACTION_SECONDS = 3  # while the map is still empty, poll this often so
 # the first cards are on screen inside the first ~10s of a demo instead of at
 # the end of the first full 20s cycle.
@@ -413,9 +417,15 @@ async def lecture_ws(ws: WebSocket):
             if msg.get("force"):
                 force_event.set()
 
-    async def run_extraction(transcript: str) -> bool:
-        """Returns True on success, False on error (caller uses this to back off)."""
-        state["last_extracted"] = transcript
+    async def run_extraction(transcript: str, stable: str) -> bool:
+        """`transcript` is what Gemini sees (partial included, so the map reacts
+        mid-sentence); `stable` is only the committed + typed text, and is what
+        the "has anything new been said?" gate measures against. Keying that gate
+        on the partial would compare against text that rewrites itself on every
+        interim result, so it would never fire while anyone is speaking.
+
+        Returns True on success, False on error (caller uses this to back off)."""
+        state["last_extracted"] = stable
         try:
             graph = extract_flowchart(transcript, state["graph"])
         except Exception as e:
@@ -438,11 +448,15 @@ async def lecture_ws(ws: WebSocket):
         last_call_at = 0.0
         backoff_until = 0.0
         backoff_seconds = BACKOFF_START_SECONDS
+        fast_attempts = 0
         while True:
             # An empty map is the one moment where latency is worth an extra
-            # call: tick fast until the first cards exist, then settle into the
-            # quota-friendly 20s cadence.
-            first_pass = not state["graph"].get("nodes")
+            # call: tick fast for the first few attempts, then settle into the
+            # quota-friendly cadence whether or not those attempts found nodes.
+            first_pass = (
+                fast_attempts < FAST_MODE_MAX_ATTEMPTS
+                and not state["graph"].get("nodes")
+            )
             interval = FIRST_EXTRACTION_SECONDS if first_pass else EXTRACTION_INTERVAL_SECONDS
             forced = False
             try:
@@ -454,6 +468,9 @@ async def lecture_ws(ws: WebSocket):
 
             # the uncommitted tail counts: the student is mid-sentence and the
             # map should already be reacting to it.
+            stable = " ".join(
+                p for p in (state["transcript"], state["manual"]) if p
+            ).strip()
             transcript = " ".join(
                 p for p in (state["transcript"], state["partial"], state["manual"]) if p
             ).strip()
@@ -475,13 +492,15 @@ async def lecture_ws(ws: WebSocket):
             if now - last_call_at < MIN_SECONDS_BETWEEN_CALLS:
                 continue
 
-            if not forced and len(transcript) - len(state["last_extracted"]) < MIN_NEW_CHARS:
-                continue  # not enough new speech to be worth a call
+            if not forced and len(stable) - len(state["last_extracted"]) < MIN_NEW_CHARS:
+                continue  # not enough new *committed* speech to be worth a call
 
             last_call_at = now
+            if first_pass:
+                fast_attempts += 1
             state["busy"] = True
             try:
-                ok = await run_extraction(transcript)
+                ok = await run_extraction(transcript, stable)
             finally:
                 state["busy"] = False
             if ok:
