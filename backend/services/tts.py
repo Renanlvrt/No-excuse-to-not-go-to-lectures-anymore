@@ -9,10 +9,16 @@ Async httpx + truststore for the same reason videogen.py uses them: every
 blocking call here freezes the single event loop, and threads deadlock on
 this machine.
 
-Cached to disk by (concept slug, level) and served from the /audio mount,
-so a replay costs zero characters of the free-tier TTS quota and never
-ships a payload over the websocket.
+Cached to disk by (concept slug, level, hash of the spoken text) and served
+from the /audio mount, so a replay of identical text costs zero characters of
+the free-tier TTS quota and never ships a payload over the websocket. The
+text hash is what makes the cache honest: the same concept at the same level
+can be asked to speak different text (a definition before the deep
+explanation exists, the deep explanation after), and those must never land on
+the same file.
 """
+import hashlib
+import re
 from pathlib import Path
 
 import httpx
@@ -36,13 +42,21 @@ LEVEL_VOICES = {
 }
 
 
-def _cached_path(label: str, level: int) -> Path:
-    return AUDIO_DIR / f"{slug(label)}_l{level}.mp3"
+def _text_hash(text: str) -> str:
+    normalised = re.sub(r"\s+", " ", text).strip().lower()
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:12]
+
+
+def _cached_path(label: str, level: int, text: str) -> Path:
+    """Key includes a hash of the exact text sent to the API, so two different
+    texts for one (concept, level) can never collide onto one mp3."""
+    return AUDIO_DIR / f"{slug(label)}_l{level}_{_text_hash(text)}.mp3"
 
 
 async def speak_level(label: str, level: int, text: str, api_key: str, force: bool = False) -> tuple[str, bool]:
     """Returns (filename_relative_to_AUDIO_DIR, was_cached)."""
-    cached = _cached_path(label, level)
+    spoken = text[:MAX_CHARS]
+    cached = _cached_path(label, level, spoken)
     if not force and cached.exists():
         return cached.name, True
 
@@ -52,7 +66,7 @@ async def speak_level(label: str, level: int, text: str, api_key: str, force: bo
             f"{BASE_URL}/{voice['voice_id']}",
             headers={"xi-api-key": api_key, "Content-Type": "application/json"},
             json={
-                "text": text[:MAX_CHARS],
+                "text": spoken,
                 "model_id": MODEL_ID,
                 "voice_settings": {
                     "stability": voice["stability"],
