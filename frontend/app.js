@@ -202,6 +202,7 @@ function mergeGraph(data) {
           widgetPending: false, imagePending: false, askPending: false,
           videoPending: false, videoUrl: null,
           deep: null, deepPending: false, level: null, // level: per-node override of globalLevel
+          audioUrls: {}, audioPending: false, // per-level TTS, keyed 1/2/3
           checkPending: false, checkQuestion: null, checkAnswered: false,
         },
         n, { steps: n.steps || [] }
@@ -318,6 +319,9 @@ function createCard(node) {
 // ---------- right panel: the real interaction surface for one selected node ----------
 function selectNode(nodeId) {
   selectedNodeId = nodeId;
+  // the server needs to know which card a spoken "explain that simpler"
+  // refers to.
+  if (wsReady()) ws.send(JSON.stringify({ type: "select_node", node_id: nodeId }));
   for (const id in cardEls) cardEls[id].classList.toggle("selected", id === nodeId);
   renderPanel();
 }
@@ -392,6 +396,8 @@ function renderLevelSection(node) {
   body.className = "panel-definition";
   panelEl.appendChild(body);
 
+  renderSpeakButton(node, level);
+
   if (level === 1) {
     body.textContent = node.analogy || "No analogy for this concept — try Mechanism.";
     return;
@@ -415,6 +421,42 @@ function renderLevelSection(node) {
     btn.addEventListener("click", () => requestDeep(node));
   }
   panelEl.appendChild(btn);
+}
+
+// One voice per level (warm/slow, neutral, fast/dense) so the sound says
+// which level you're on. Synthesis is cached per (concept, level) on the
+// server, so replaying costs zero characters of the TTS quota.
+function renderSpeakButton(node, level) {
+  const url = (node.audioUrls || {})[level];
+  if (url) {
+    const audio = document.createElement("audio");
+    audio.src = url;
+    audio.controls = true;
+    audio.autoplay = node.audioAutoplay === level; // only the freshly returned one
+    node.audioAutoplay = null;
+    audio.className = "level-audio";
+    panelEl.appendChild(audio);
+    return;
+  }
+  const btn = document.createElement("button");
+  btn.className = "speak-btn";
+  if (node.audioPending) {
+    btn.textContent = "Voicing…";
+    btn.disabled = true;
+  } else {
+    btn.textContent = "🔊 Read it to me";
+    btn.addEventListener("click", () => requestSpeak(node, level));
+  }
+  panelEl.appendChild(btn);
+}
+
+function requestSpeak(node, level) {
+  if (node.audioPending) return;
+  if (!wsReady()) return;
+  node.lastError = null;
+  node.audioPending = true;
+  ws.send(JSON.stringify({ type: "speak_level", node_id: node.id, level }));
+  if (selectedNodeId === node.id) renderPanel();
 }
 
 function requestDeep(node) {
@@ -949,6 +991,7 @@ function connect() {
         ask: "That didn't go through - try asking again.",
         generate_check: "Couldn't generate a check question - try again.",
         explain_deep: "Couldn't generate the rigorous version - try again.",
+        speak_level: "Couldn't read that out loud - try again.",
         generate_quiz: "Couldn't generate the quiz - try again.",
         generate_summary: "Couldn't generate the wrap-up summary - try again.",
         transcribe: "ElevenLabs transcription dropped - press Stop then Start to reconnect, or use the text box below.",
@@ -972,6 +1015,7 @@ function connect() {
         if (msg.context === "ask") node.askPending = false;
         if (msg.context === "generate_check") node.checkPending = false;
         if (msg.context === "explain_deep") node.deepPending = false;
+        if (msg.context === "speak_level") node.audioPending = false;
         if (selectedNodeId === msg.node_id) renderPanel();
       }
 
@@ -1006,6 +1050,25 @@ function connect() {
         node.qa.push({ question: msg.question, answer: msg.answer });
         node.askPending = false;
         if (selectedNodeId === msg.node_id) renderPanel();
+      }
+    } else if (msg.type === "audio") {
+      const node = nodeState[msg.node_id];
+      if (node) {
+        if (!node.audioUrls) node.audioUrls = {};
+        node.audioUrls[msg.level] = msg.audio_url;
+        node.audioPending = false;
+        node.audioAutoplay = msg.level;
+        if (selectedNodeId === msg.node_id) renderPanel();
+      }
+    } else if (msg.type === "level_intent") {
+      // spoken command ("explain that simpler") matched server-side by a
+      // local regex - no LLM call, so it lands instantly.
+      const node = nodeState[msg.node_id];
+      if (node) {
+        node.level = msg.level;
+        setStatus(`🎙 "${msg.phrase}" → level ${msg.level}`, "ok");
+        if (selectedNodeId === msg.node_id) renderPanel();
+        if (msg.level === 3 && !node.deep) requestDeep(node);
       }
     } else if (msg.type === "deep") {
       const node = nodeState[msg.node_id];

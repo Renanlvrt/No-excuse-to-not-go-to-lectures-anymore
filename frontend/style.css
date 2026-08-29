@@ -180,6 +180,8 @@ button:disabled { opacity: 0.5; cursor: default; }
   border: 1px solid var(--border); background: var(--bg); color: var(--muted); cursor: pointer;
 }
 .level-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.speak-btn { font-size: 0.8rem; padding: 0.3rem 0.6rem; }
+.level-audio { width: 100%; height: 34px; margin: 0 0 0.6rem; }
 
 .panel-section { margin: 1.1rem 0; padding-top: 1.1rem; border-top: 1px solid var(--border); }
 .panel-section h3 { margin: 0 0 0.5rem; font-size: 0.9rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
