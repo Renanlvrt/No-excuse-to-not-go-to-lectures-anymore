@@ -1,6 +1,7 @@
 """FastAPI app: live transcript text in -> live growing concept-graph out."""
 import asyncio
 import os
+import time
 import pip_system_certs.wrapt_requests  # trust Windows cert store (fixes Avast SSL-scan MITM)
 from pathlib import Path
 from dotenv import load_dotenv
@@ -33,15 +34,22 @@ app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 FIRST_EXTRACTION_SECONDS = 3  # while the map is still empty, poll this often so
 # the first cards are on screen inside the first ~10s of a demo instead of at
 # the end of the first full 20s cycle.
-FIRST_EXTRACTION_MIN_CHARS = 120  # ...but only once there's actually a couple of
+FIRST_EXTRACTION_MIN_CHARS = 90  # ...but only once there's actually a couple of
 # sentences to extract from, otherwise the first call burns quota on "So,".
-EXTRACTION_INTERVAL_SECONDS = 20  # ~3 calls/min: stays well under Gemini free-tier's
+EXTRACTION_INTERVAL_SECONDS = 12  # ~5 calls/min: stays well under Gemini free-tier's
 # ~10 RPM cap, and under a ~2hr live lecture keeps total calls within the free
 # tier's daily request budget (reportedly as low as ~250/day for flash models
 # on the free tier as of late-2025 quota cuts).
-MAX_BACKOFF_SKIPS = 6  # after an error (e.g. rate-limited), wait up to 6 extra
-# cycles (~2 more minutes) before trying again, instead of hammering an API
-# that's already saying no.
+MIN_SECONDS_BETWEEN_CALLS = 7  # hard floor between two Gemini extractions, honoured
+# even by the fast empty-map cadence and by an explicit "generate now" click. The
+# tick interval alone can't bound the call rate: the transcript mutates on every
+# partial, so a 3s tick means a call every 3s (~20/min) against a ~10 RPM cap.
+MIN_NEW_CHARS = 80  # ...and the transcript has to have actually moved on. Without
+# this, one more word in a mutating partial reads as "new" and buys a full call.
+BACKOFF_START_SECONDS = 15  # after an error (e.g. rate-limited), wait this long,
+BACKOFF_MAX_SECONDS = 90    # doubling up to here, before trying again - in real
+# seconds, not in ticks, so a fast empty-map cadence can't shrink the backoff to
+# nothing at exactly the moment the API is asking to be left alone.
 
 
 def _find_node(graph: dict, node_id: str) -> dict | None:
@@ -374,6 +382,22 @@ async def lecture_ws(ws: WebSocket):
                     state["busy"] = False
                 continue
 
+            if msg_type == "speech_segment":
+                # Chrome's own Web Speech engine transcribes in the browser and
+                # posts each final segment here, so it lands in exactly the same
+                # place (and runs the same level-intent regex) as an ElevenLabs
+                # committed segment.
+                text = (msg.get("text") or "").strip()
+                if text:
+                    await on_committed(text)
+                continue
+
+            if msg_type == "speech_partial":
+                # interim words feed extraction immediately instead of waiting
+                # for Chrome to finalise the sentence.
+                state["partial"] = msg.get("text") or ""
+                continue
+
             if msg_type == "manual_text":
                 # kept separate from the speech transcript: with ElevenLabs the
                 # server owns `transcript`, so letting the text box overwrite it
@@ -405,10 +429,18 @@ async def lecture_ws(ws: WebSocket):
         return True
 
     async def extraction_loop():
-        backoff_skips_remaining = 0
+        # Every gate below is in wall-clock seconds rather than in loop ticks.
+        # The tick rate changes (3s while the map is empty, 20s after) and the
+        # transcript mutates continuously while anyone is speaking, so a gate
+        # counted in ticks silently becomes 6x tighter in exactly the situation
+        # it exists to protect: an empty map, a talking lecturer, and an API
+        # that is already rate-limiting us.
+        last_call_at = 0.0
+        backoff_until = 0.0
+        backoff_seconds = BACKOFF_START_SECONDS
         while True:
             # An empty map is the one moment where latency is worth an extra
-            # call: poll fast until the first cards exist, then settle into the
+            # call: tick fast until the first cards exist, then settle into the
             # quota-friendly 20s cadence.
             first_pass = not state["graph"].get("nodes")
             interval = FIRST_EXTRACTION_SECONDS if first_pass else EXTRACTION_INTERVAL_SECONDS
@@ -431,22 +463,32 @@ async def lecture_ws(ws: WebSocket):
             if first_pass and not forced and len(transcript) < FIRST_EXTRACTION_MIN_CHARS:
                 continue
 
-            if state["busy"] and not forced:
+            if state["busy"]:
                 continue  # a user action (ask/image/widget) is running - don't queue behind it
 
-            if backoff_skips_remaining > 0 and not forced:
-                backoff_skips_remaining -= 1
+            now = time.monotonic()
+            if now < backoff_until:
+                continue  # the API said no recently; a click can't override that
+
+            # the floor applies to forced calls too - "generate now" clicked five
+            # times in a row is exactly how the quota gets spent in one second.
+            if now - last_call_at < MIN_SECONDS_BETWEEN_CALLS:
                 continue
 
-            if not forced and transcript == state["last_extracted"]:
-                continue  # nothing new since last pass, skip the Gemini call
+            if not forced and len(transcript) - len(state["last_extracted"]) < MIN_NEW_CHARS:
+                continue  # not enough new speech to be worth a call
 
+            last_call_at = now
             state["busy"] = True
             try:
                 ok = await run_extraction(transcript)
             finally:
                 state["busy"] = False
-            backoff_skips_remaining = 0 if ok else MAX_BACKOFF_SKIPS
+            if ok:
+                backoff_seconds = BACKOFF_START_SECONDS
+            else:
+                backoff_until = time.monotonic() + backoff_seconds
+                backoff_seconds = min(backoff_seconds * 2, BACKOFF_MAX_SECONDS)
 
     try:
         await asyncio.gather(receive_loop(), extraction_loop())

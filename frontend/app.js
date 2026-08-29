@@ -32,6 +32,7 @@ const simOverlayTitle = document.getElementById("simOverlayTitle");
 const simOverlayClose = document.getElementById("simOverlayClose");
 
 const levelSelect = document.getElementById("levelSelect");
+const tabAudioBtn = document.getElementById("tabAudioBtn");
 const keyBox = document.getElementById("keyBox");
 const keyInput = document.getElementById("keyInput");
 const keySaveBtn = document.getElementById("keySaveBtn");
@@ -49,8 +50,15 @@ let hasKey = false;          // set by the backend's stt_status message
 // generated exam-level text. Switching levels NEVER triggers a request -
 // only the Rigour tab's explicit button does, once per concept ever.
 let globalLevel = 2;
-let partialTranscript = "";  // ElevenLabs interim text, replaced as it firms up
+let partialTranscript = "";  // interim text, replaced as it firms up
 let audioStream = null, audioContext = null, audioNode = null, audioSource = null;
+
+// Chrome's own speech engine is the default mic path again: it transcribes
+// on-device with near-zero latency and costs no ElevenLabs quota. ElevenLabs
+// Scribe stays wired up for tab audio (Web Speech can't consume a MediaStream)
+// and as the fallback on browsers without the API.
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognitionInstance = null;
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
@@ -1065,23 +1073,78 @@ startBtn.onclick = () => {
     listening = false;
     startBtn.textContent = "▶ Start listening";
     startBtn.classList.remove("active");
+    if (recognitionInstance) { try { recognitionInstance.stop(); } catch (e) {} }
+    recognitionInstance = null;
     stopElevenLabsCapture();
     setStatus(wsConnected ? "stopped listening (still connected)" : "stopped", "ok");
     return;
   }
-  // Transcription is always ElevenLabs Scribe - the browser's own engine is
-  // never used, so the transcript is identical on every laptop. All a
-  // key-less machine needs is a key pasted into the box above.
+  if (!SpeechRecognition && !hasKey) {
+    keyBox.hidden = false;
+    keyInput.focus();
+    showToast("This browser has no speech engine - paste an ElevenLabs key above instead.", "err");
+    return;
+  }
+  listening = true;
+  startBtn.textContent = "■ Stop";
+  startBtn.classList.add("active");
+  if (SpeechRecognition) startRecognition();
+  else startElevenLabsCapture();
+};
+
+// Interim results are forwarded too, so words feed concept extraction as they
+// are spoken instead of only when Chrome finalises a sentence.
+function startRecognition() {
+  const recognition = new SpeechRecognition();
+  recognitionInstance = recognition;
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = "en-US";
+
+  recognition.onresult = (event) => {
+    let interim = "";
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const chunk = event.results[i][0].transcript;
+      if (event.results[i].isFinal) {
+        if (wsReady()) ws.send(JSON.stringify({ type: "speech_segment", text: chunk }));
+      } else {
+        interim += chunk;
+      }
+    }
+    partialTranscript = interim;
+    renderTranscript();
+    if (interim && wsReady()) ws.send(JSON.stringify({ type: "speech_partial", text: interim }));
+  };
+
+  recognition.onerror = (event) => {
+    if (event.error === "no-speech" || event.error === "aborted") return;
+    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
+      showToast("Mic permission denied - allow microphone access, or use the text box below.", "err");
+      return;
+    }
+    showToast(`Mic error: ${event.error} - use the text box below if this persists.`, "err");
+  };
+
+  // Chrome ends the session on every longer silence; restart so a whole
+  // lecture keeps transcribing without anyone touching the button.
+  recognition.onend = () => { if (listening && recognitionInstance === recognition) { try { recognition.start(); } catch (e) {} } };
+  try {
+    recognition.start();
+    setStatus("listening 🎙️ (Chrome speech)", "ok");
+  } catch (e) {
+    setStatus("Could not start microphone - use the text box below instead.", "err");
+  }
+}
+
+tabAudioBtn.onclick = () => {
+  if (listening) { startBtn.click(); return; }
   if (!hasKey) {
     keyBox.hidden = false;
     keyInput.focus();
     showToast("Paste an ElevenLabs API key above to start transcribing.", "err");
     return;
   }
-  listening = true;
-  startBtn.textContent = "■ Stop";
-  startBtn.classList.add("active");
-  startElevenLabsCapture();
+  startTabAudioCapture();
 };
 
 // A friend's laptop has no .env, so the key can also be pasted here: it stays
@@ -1161,7 +1224,9 @@ function connect() {
     const msg = JSON.parse(event.data);
     if (msg.type === "stt_status") {
       hasKey = !!msg.has_key;
-      keyBox.hidden = hasKey;
+      // with Chrome's own engine handling the mic, a missing ElevenLabs key
+      // only matters for tab audio - don't block the demo over it.
+      keyBox.hidden = hasKey || !!SpeechRecognition;
       if (hasKey) keyInput.value = "";
     } else if (msg.type === "partial_transcript") {
       partialTranscript = msg.text || "";
@@ -1328,14 +1393,23 @@ function connect() {
   ws.onerror = () => setStatus("connection error - retrying...", "err");
 }
 
-// ---------- ElevenLabs Scribe realtime: mic -> PCM16 16kHz -> our backend
+// ---------- ElevenLabs Scribe realtime: audio -> PCM16 16kHz -> our backend
 // websocket -> ElevenLabs. The API key stays server-side, and the browser
 // never has to be Chrome/Edge (no Web Speech API involved). ----------
+
+// A lecture is far-field speech, and it is often a recording playing out of
+// this same laptop. Both browser "cleanups" work against that: echo
+// cancellation treats anything also coming out of the speakers as echo and
+// subtracts it (so a lecture video playing on this machine transcribes as
+// near-silence), and noise suppression chews up a distant voice across a
+// room. Raw is what Scribe wants.
+const MIC_CONSTRAINTS = {
+  echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1,
+};
+
 async function startElevenLabsCapture() {
   try {
-    audioStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
-    });
+    audioStream = await navigator.mediaDevices.getUserMedia({ audio: MIC_CONSTRAINTS });
   } catch (e) {
     listening = false;
     startBtn.textContent = "▶ Start listening";
@@ -1343,7 +1417,42 @@ async function startElevenLabsCapture() {
     showToast("Mic permission denied - allow microphone access, or use the text box below instead.", "err");
     return;
   }
+  await pumpStreamToScribe("listening 🎙️ (ElevenLabs Scribe)");
+}
 
+// Transcribe a lecture playing in another tab (a recorded lecture, a video
+// call) by capturing that tab's audio directly instead of routing it through
+// the room and back in via the mic - no speaker volume, no echo, no room
+// noise, and it is the only way this works at all on a machine whose mic
+// can't hear its own output.
+async function startTabAudioCapture() {
+  let display;
+  try {
+    display = await navigator.mediaDevices.getDisplayMedia({
+      video: true,  // Chrome refuses an audio-only capture; the track is dropped below
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+  } catch (e) {
+    showToast("Tab capture cancelled.", "err");
+    return;
+  }
+  if (!display.getAudioTracks().length) {
+    display.getTracks().forEach((t) => t.stop());
+    showToast("That capture had no audio - pick a tab and tick 'Share tab audio'.", "err");
+    return;
+  }
+  display.getVideoTracks().forEach((t) => { t.stop(); display.removeTrack(t); });
+  audioStream = display;
+  listening = true;
+  startBtn.textContent = "■ Stop";
+  startBtn.classList.add("active");
+  tabAudioBtn.classList.add("active");
+  // the user can also end the share from Chrome's own bar
+  audioStream.getAudioTracks()[0].onended = () => { if (listening) startBtn.click(); };
+  await pumpStreamToScribe("listening 🔊 (tab audio → ElevenLabs Scribe)");
+}
+
+async function pumpStreamToScribe(statusText) {
   // asking the AudioContext for 16kHz directly means no manual resampling:
   // it's exactly the rate the realtime API expects (pcm_16000).
   audioContext = new AudioContext({ sampleRate: 16000 });
@@ -1372,7 +1481,7 @@ async function startElevenLabsCapture() {
   mute.gain.value = 0;
   audioNode.connect(mute);
   mute.connect(audioContext.destination);
-  setStatus("listening 🎙️ (ElevenLabs Scribe)", "ok");
+  setStatus(statusText, "ok");
 }
 
 function stopElevenLabsCapture() {
@@ -1380,6 +1489,7 @@ function stopElevenLabsCapture() {
   if (audioSource) { try { audioSource.disconnect(); } catch (e) {} audioSource = null; }
   if (audioContext) { try { audioContext.close(); } catch (e) {} audioContext = null; }
   if (audioStream) { audioStream.getTracks().forEach((t) => t.stop()); audioStream = null; }
+  tabAudioBtn.classList.remove("active");
   partialTranscript = "";
   renderTranscript();
   if (wsReady()) ws.send(JSON.stringify({ type: "audio_stop" }));
