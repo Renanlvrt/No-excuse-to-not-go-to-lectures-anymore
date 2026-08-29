@@ -10,12 +10,13 @@ for the full objective checklist and what's actually been verified.
 ```powershell
 .\start.ps1
 ```
-Then open **http://localhost:8010/static/index.html** (any modern browser -
-transcription is ElevenLabs Scribe server-side, not the Chrome-only Web
-Speech API; `GEMINI_API_KEY` and `ELEVENLABS_API_KEY` live in `.env`).
+Then open **http://localhost:8010/static/index.html** — **Chrome preferred**:
+the mic path is Chrome's own Web Speech API, with ElevenLabs Scribe as the
+fallback on browsers that don't have it. `GEMINI_API_KEY` and
+`ELEVENLABS_API_KEY` live in `.env`.
 
 Click **▶ Start listening** and talk. Concepts accumulate on a pannable/
-zoomable canvas roughly every ~20s (or hit **⚡ Generate diagram now**).
+zoomable canvas roughly every ~15s (or hit **⚡ Generate diagram now**).
 Click any card to flip it and see its definition, ask it a follow-up
 question, or generate an illustrative image. Cards tagged as a multi-step
 process get a **▶ Play** button that animates through their steps.
@@ -23,20 +24,30 @@ process get a **▶ Play** button that animates through their steps.
 **No mic, or recognition isn't picking anything up?** Type/paste lecture
 text into the box under the transcript — same pipeline, fully verified path.
 
-## Transcription: ElevenLabs Scribe realtime
-The mic is captured as PCM16 @16kHz in the browser and streamed over the
-app's own websocket to the backend, which relays it to ElevenLabs' realtime
-STT websocket (`scribe_v2_realtime`, VAD commit strategy) — so the API key
-never reaches the browser. `partial_transcript` events render as live
+## Transcription: two paths
+**Mic → Chrome Web Speech API (the default).** Chrome transcribes on-device
+and `frontend/app.js` posts each final sentence as a `speech_segment`
+websocket message and interim words as `speech_partial`. The backend feeds
+`speech_segment` into exactly the same path as an ElevenLabs committed
+segment (transcript append + the level-intent regex), so no feature cares
+which engine produced the text. Costs no ElevenLabs quota and has near-zero
+latency.
+
+**ElevenLabs Scribe realtime** (`backend/services/transcribe.py`) is still
+wired up and used for two things: the **🔊 Listen to a tab** button (Web
+Speech cannot consume a captured `MediaStream`, and tab capture is the only
+thing that works when the mic can't hear the machine's own speakers), and as
+the **mic fallback** on any browser without the Web Speech API. Audio is
+captured as PCM16 @16kHz and streamed over the app's own websocket to the
+backend, which relays it to `scribe_v2_realtime` (VAD commit strategy) — the
+API key never reaches the browser. `partial_transcript` events render as live
 interim text; `committed_transcript` events append to the server-side
 transcript that feeds the Gemini extraction loop.
 
-This is the *only* transcription path — the browser's own Web Speech API is
-never used, so every laptop gets the same accuracy. On a machine with no
-`ELEVENLABS_API_KEY` in `.env`, the backend reports `has_key: false` and the
-UI shows a key box: paste a key there and it's kept in that browser's
-`localStorage`, sent to *this* backend on every (re)connect, and used for
-that connection only. Nothing to install on a friend's laptop beyond the app.
+On a machine with no `ELEVENLABS_API_KEY` in `.env`, the backend reports
+`has_key: false`; on a browser with no Web Speech API the UI then shows a key
+box — paste a key there and it's kept in that browser's `localStorage`, sent
+to *this* backend on every (re)connect, and used for that connection only.
 
 ## How a concept becomes a card
 1. The transcript is sent to Gemini along with the concept map already built
@@ -88,23 +99,35 @@ uvicorn backend.main:app --port 8010
   would need real fixing (e.g. a subprocess-based worker, since threads are
   the one thing confirmed unsafe here) for multiple concurrent users.
 - **Multiple Gemini model names = separate free-tier quota pools.**
-  `backend/services/llm.py` tries a fallback chain
-  (`gemini-flash-lite-latest` → `gemini-flash-latest` →
-  `gemini-3.1-flash-lite` → `gemini-3.6-flash`) so one model running out
+  `backend/services/llm.py` tries a fallback chain so one model running out
   mid-demo doesn't take the app down — this saved a live demo once already.
+  The chain is ordered **for latency, not just quota**:
+  `gemini-3.1-flash-lite` → `gemini-flash-lite-latest` → `gemini-3.6-flash` →
+  `gemini-flash-latest`. `gemini-3.1-flash-lite` answers in ~2s, the `-latest`
+  aliases take 10-18s, and `gemini-flash-latest` is currently 429ing; since
+  every call blocks the event loop, the fastest healthy model goes first.
   `backend/services/imagegen.py` has its own chain for image-capable models.
-- **20s extraction interval** (`EXTRACTION_INTERVAL_SECONDS` in
-  `backend/main.py`): a conservative guess balancing "feels live" against
-  free-tier rate limits, not a precisely measured number. Backs off
-  automatically for ~2min after any error.
-- Text model in use: `gemini-3.6-flash` (chain above as fallback). Image
+- **Extraction is capped at 2 attempts × 10s** (`max_attempts=2` in
+  `backend/services/diagram.py`), so walking the whole chain past a slow model
+  can't stall the event loop.
+- **Extraction cadence and quota guards** (`backend/main.py`):
+  `EXTRACTION_INTERVAL_SECONDS = 12` in steady state, a hard wall-clock floor
+  of `MIN_SECONDS_BETWEEN_CALLS = 7` between any two calls (an explicit
+  "generate now" click included), a fast empty-map mode capped at
+  `FAST_MODE_MAX_ATTEMPTS = 3` attempts, and a `MIN_NEW_CHARS = 80` gate that
+  measures committed + typed text only (never the mutating partial). After an
+  error it backs off 15s, doubling to 90s. Measured on a real 2-minute
+  lecture-pace run: first cards at ~13.6s, then a new extraction every ~15s,
+  3.8 Gemini calls/min, 0 errors, 10 nodes.
+- Text model tried first: `gemini-3.1-flash-lite` (chain above as fallback). Image
   models: `gemini-3.1-flash-image` (chain, see `imagegen.py`) — Google's
   model lineup moves fast; expect to need updates as models get retired.
 
 ## Sponsors (RUN/HACK, London, Aug 29 2026)
 - **Google Gemini** — the actual LLM in use, powers everything
-- **ElevenLabs** — Scribe v2 realtime is now the transcription engine
-  (`backend/services/transcribe.py`); the browser's Web Speech API is unused.
+- **ElevenLabs** — Scribe v2 realtime transcription for tab audio and as the
+  mic fallback (`backend/services/transcribe.py`), plus per-level TTS
+  (`backend/services/tts.py`). Video generation is 402-blocked on free tier.
 - Tavily — no working API key; not wired in.
 - ⚠️ RUN/HACK's official sponsor list wasn't published as of building this —
   ElevenLabs/Tavily were guesses based on the hackathon name pattern, not
@@ -115,7 +138,7 @@ uvicorn backend.main:app --port 8010
 frontend/index.html    Markup shell, loads d3 (CDN) + style.css + app.js
 frontend/style.css      Flip-card 3D, canvas/viewport, dark-mode tokens
 frontend/app.js         Everything client-side: WebSocket + reconnect,
-                         speech recognition, d3-force physics + custom
+                         Web Speech mic + Scribe audio pump, d3-force physics + custom
                          rect-collision, card render/flip/play/ask/image,
                          pan/zoom (pointer events, mouse+touch+pinch)
 backend/main.py          FastAPI + WebSocket: per-connection accumulated
