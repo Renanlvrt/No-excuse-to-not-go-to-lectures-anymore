@@ -183,14 +183,19 @@ want funding to run.
 
 **Q5. "The lecturer's own voice is in the same mic. Doesn't it fire
 commands on the lecture itself?"**
-It did, badly, and it's the bug we're most exposed on. `intent.py` is a
-local regex and it matches words like "proof", "intuition" and "deeper" —
-the most common words in a maths lecture. It's been narrowed to per-sentence
-matching with a nine-word cap so a real lecture sentence can't trigger it,
-but bare-noun triggers are still in the pattern list. Real fix is a
-push-to-talk key or a wake word; we chose regex over an LLM call because it
-has to run on every committed segment for free and can't queue behind
-extraction. Ask us again in a week.
+It did, and that's now fixed — worth knowing exactly how, because it's the
+sharpest bit of engineering in the build. `intent.py` is a local regex, not
+an LLM call, because it has to run on every committed segment for free
+without queueing behind extraction. The problem is that the lecture's
+vocabulary *is* the trigger vocabulary — "proof", "intuition",
+"mechanism", "deeper". So a bare topic word never fires. A match needs an
+*addressed command*: an imperative anchored at the start of the sentence
+("explain that simpler", "go deeper", "give me the proof"), or a first/
+second-person complaint ("I don't get it", "you lost me"). "We go deeper
+into this next week" and "this proof is rigorous" are lecture, and return
+None. Residual risk is now the other direction — phrasing it didn't
+anticipate silently does nothing — which is why the level tabs are always
+one click away. A push-to-talk key is the real long-term answer.
 
 **Q6. "Does this actually scale, or is it one laptop?"**
 One laptop, today, honestly. Every Gemini call runs inline on the single
@@ -305,11 +310,17 @@ Ranked by how likely they are to bite you.
    text. Our defence is "the live artifact is better", not "the recording
    can't". If a judge pushes twice, concede the point cleanly (Q2) — a
    defensive answer here is worse than the concession.
-2. **Voice-driven level switching is the most impressive beat and the most
-   likely to misfire live.** `intent.py` still matches bare nouns
-   ("proof", "intuition", "deeper", "mechanism"), and the lecturer's own
-   voice is in the same stream. It may fire on the content you're demoing.
+2. **Voice-driven level switching is the most impressive beat and the one
+   most likely to no-op live.** `intent.py` was tightened at ~16:50 to
+   require an *addressed command* rather than a bare noun, which kills the
+   false-trigger-on-the-lecturer problem but makes the matcher strict.
+   **Rehearse the exact phrases that are in the pattern list** — "explain
+   that simpler", "go deeper", "how does that actually work", "back to
+   normal" all match; improvised paraphrases may not. It also only fires
+   on a *committed* Scribe segment, so there's a second or two of lag.
    Have the click-the-tab fallback rehearsed; do not retry the phrase.
+   (This change landed after the pitch was drafted and has not been
+   exercised through real speech — verify it with the mic before stage.)
 3. **Free-tier quota is a live single point of failure and has already
    failed once today** (all three image models exhausted during testing —
    `SUCCESS_CRITERIA.md` #8, README). Fresh extraction is the vulnerable
