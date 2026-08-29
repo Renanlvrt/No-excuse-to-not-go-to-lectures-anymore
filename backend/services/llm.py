@@ -56,6 +56,12 @@ def generate_with_fallback(
             )
         except Exception as e:
             last_error = e
+            # Move the sticky pointer off a model that just failed. Otherwise a
+            # model that runs out of daily quota stays first in line and, with
+            # max_attempts=2, burns half of every later call on a known-dead
+            # model - the app then only recovers on a server restart.
+            if _working_model_index == i:
+                _working_model_index = (i + 1) % len(MODEL_FALLBACK_CHAIN)
             continue
         _working_model_index = i
         return response.text or ""
