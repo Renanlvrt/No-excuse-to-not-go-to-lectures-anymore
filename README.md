@@ -10,8 +10,9 @@ for the full objective checklist and what's actually been verified.
 ```powershell
 .\start.ps1
 ```
-Then open **http://localhost:8010/static/index.html** in **Chrome** (Web
-Speech API is Chrome/Edge-only; `GEMINI_API_KEY` is already set in `.env`).
+Then open **http://localhost:8010/static/index.html** (any modern browser -
+transcription is ElevenLabs Scribe server-side, not the Chrome-only Web
+Speech API; `GEMINI_API_KEY` and `ELEVENLABS_API_KEY` live in `.env`).
 
 Click **▶ Start listening** and talk. Concepts accumulate on a pannable/
 zoomable canvas roughly every ~20s (or hit **⚡ Generate diagram now**).
@@ -21,6 +22,21 @@ process get a **▶ Play** button that animates through their steps.
 
 **No mic, or recognition isn't picking anything up?** Type/paste lecture
 text into the box under the transcript — same pipeline, fully verified path.
+
+## Transcription: ElevenLabs Scribe realtime
+The mic is captured as PCM16 @16kHz in the browser and streamed over the
+app's own websocket to the backend, which relays it to ElevenLabs' realtime
+STT websocket (`scribe_v2_realtime`, VAD commit strategy) — so the API key
+never reaches the browser. `partial_transcript` events render as live
+interim text; `committed_transcript` events append to the server-side
+transcript that feeds the Gemini extraction loop.
+
+This is the *only* transcription path — the browser's own Web Speech API is
+never used, so every laptop gets the same accuracy. On a machine with no
+`ELEVENLABS_API_KEY` in `.env`, the backend reports `has_key: false` and the
+UI shows a key box: paste a key there and it's kept in that browser's
+`localStorage`, sent to *this* backend on every (re)connect, and used for
+that connection only. Nothing to install on a friend's laptop beyond the app.
 
 ## How a concept becomes a card
 1. The transcript is sent to Gemini along with the concept map already built
@@ -41,13 +57,11 @@ See `SUCCESS_CRITERIA.md` for the full, itemized, automated-verification
 checklist (10/10 core categories, all driven through the real running app
 with Playwright, not just eyeballed). Two honest gaps:
 
-- **Browser SpeechRecognition transcribing real speech**: can't be verified
-  headlessly (a fresh automated Chrome profile has no on-device recognition
-  model, and cloud recognition behaves differently under automation). Real
-  audio reaching the browser *was* verified directly (measured signal via
-  getUserMedia) — this is the same tech as everyday Chrome dictation and
-  should just work when you talk into it; the manual text box is the
-  proven fallback if it doesn't.
+- **Live mic → ElevenLabs with a real speaker**: the full backend path was
+  verified with synthesized audio (partial → committed → transcript), and
+  real audio reaching the browser was verified directly (measured signal via
+  getUserMedia), but nobody has spoken into it under automation. The manual
+  text box is the proven fallback if it misbehaves.
 - **A successful on-demand image render**: the mechanism (single call per
   click, never automatic, graceful failure with per-card recovery) is fully
   verified — including a real bug found and fixed where a failed request
@@ -89,9 +103,9 @@ uvicorn backend.main:app --port 8010
 
 ## Sponsors (RUN/HACK, London, Aug 29 2026)
 - **Google Gemini** — the actual LLM in use, powers everything
-- ElevenLabs / Tavily — planned but no working API key was found anywhere on
-  this machine; not wired in. Browser's built-in Web Speech API substitutes
-  for transcription (free, zero-key).
+- **ElevenLabs** — Scribe v2 realtime is now the transcription engine
+  (`backend/services/transcribe.py`); the browser's Web Speech API is unused.
+- Tavily — no working API key; not wired in.
 - ⚠️ RUN/HACK's official sponsor list wasn't published as of building this —
   ElevenLabs/Tavily were guesses based on the hackathon name pattern, not
   confirmed sponsors.
@@ -113,7 +127,7 @@ backend/services/
                           into the prompt; merges + never-delete safety net)
   qa.py                   Per-node follow-up Q&A
   imagegen.py              On-demand image generation, its own model chain
-  transcribe.py            (unused - ElevenLabs STT, no key found)
+  transcribe.py            ElevenLabs Scribe: batch helper + realtime session
   enrich.py                (unused - Tavily search, no key found)
 ```
 

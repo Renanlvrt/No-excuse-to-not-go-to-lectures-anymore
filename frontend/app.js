@@ -31,7 +31,10 @@ const simOverlayBox = document.querySelector(".sim-overlay-box");
 const simOverlayTitle = document.getElementById("simOverlayTitle");
 const simOverlayClose = document.getElementById("simOverlayClose");
 
-const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const keyBox = document.getElementById("keyBox");
+const keyInput = document.getElementById("keyInput");
+const keySaveBtn = document.getElementById("keySaveBtn");
+
 let fullTranscript = "";
 let ws;
 let listening = false;      // mic/speech-recognition state
@@ -39,7 +42,9 @@ let wsConnected = false;    // websocket state - INDEPENDENT of listening now,
 // so ask/quiz/simulations/wrap-up etc. keep working after you hit Stop
 let reconnectDelay = 1000;
 let selectedNodeId = null;
-let recognitionInstance = null;
+let hasKey = false;          // set by the backend's stt_status message
+let partialTranscript = "";  // ElevenLabs interim text, replaced as it firms up
+let audioStream = null, audioContext = null, audioNode = null, audioSource = null;
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
@@ -750,22 +755,64 @@ startBtn.onclick = () => {
     listening = false;
     startBtn.textContent = "▶ Start listening";
     startBtn.classList.remove("active");
-    if (recognitionInstance) { try { recognitionInstance.stop(); } catch (e) {} }
+    stopElevenLabsCapture();
     setStatus(wsConnected ? "stopped listening (still connected)" : "stopped", "ok");
+    return;
+  }
+  // Transcription is always ElevenLabs Scribe - the browser's own engine is
+  // never used, so the transcript is identical on every laptop. All a
+  // key-less machine needs is a key pasted into the box above.
+  if (!hasKey) {
+    keyBox.hidden = false;
+    keyInput.focus();
+    showToast("Paste an ElevenLabs API key above to start transcribing.", "err");
     return;
   }
   listening = true;
   startBtn.textContent = "■ Stop";
   startBtn.classList.add("active");
-  if (SpeechRecognition) startRecognition();
-  else showToast("Speech recognition not supported in this browser - use the text box below instead.", "err");
+  startElevenLabsCapture();
 };
+
+// A friend's laptop has no .env, so the key can also be pasted here: it stays
+// in this browser's localStorage and is handed to our own backend (which is
+// what talks to ElevenLabs), never to a third party.
+const KEY_STORAGE = "elevenlabs_api_key";
+
+function sendStoredKey() {
+  const key = localStorage.getItem(KEY_STORAGE) || "";
+  if (key && ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "elevenlabs_key", key }));
+  }
+}
+
+keySaveBtn.onclick = () => {
+  const key = keyInput.value.trim();
+  if (!key) return;
+  localStorage.setItem(KEY_STORAGE, key);
+  if (!wsReady()) return;
+  ws.send(JSON.stringify({ type: "elevenlabs_key", key }));
+  showToast("Key saved in this browser - press Start listening.", "ok", 4000);
+};
+keyInput.addEventListener("keydown", (e) => { if (e.key === "Enter") keySaveBtn.click(); });
 
 manualInput.addEventListener("input", () => {
   if (!wsReady()) return;
-  const text = (fullTranscript + " " + manualInput.value).trim();
-  ws.send(JSON.stringify({ text }));
+  sendManualText();
 });
+
+// The typed text box is sent under its own message type: with ElevenLabs the
+// server owns the speech transcript, so a plain `{text}` update (which
+// replaces it wholesale) would erase everything transcribed so far.
+function sendManualText(force = false) {
+  if (!wsReady()) return;
+  ws.send(JSON.stringify({ type: "manual_text", text: manualInput.value, force }));
+}
+
+function renderTranscript() {
+  transcriptEl.textContent = (fullTranscript + (partialTranscript ? " " + partialTranscript : "")).trim();
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
 
 function connect() {
   setStatus("connecting...");
@@ -775,13 +822,26 @@ function connect() {
     wsConnected = true;
     setStatus(listening ? "listening 🎙️" : "connected", "ok");
     reconnectDelay = 1000;
-    const combined = (fullTranscript + " " + manualInput.value).trim();
-    if (combined) ws.send(JSON.stringify({ text: combined }));
+    sendStoredKey();
+    if (manualInput.value.trim() || fullTranscript.trim()) sendManualText();
   };
 
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.type === "diagram") {
+    if (msg.type === "stt_status") {
+      hasKey = !!msg.has_key;
+      keyBox.hidden = hasKey;
+      if (hasKey) keyInput.value = "";
+    } else if (msg.type === "partial_transcript") {
+      partialTranscript = msg.text || "";
+      renderTranscript();
+    } else if (msg.type === "transcript") {
+      // server-side (ElevenLabs) transcript is authoritative - it already
+      // holds every committed segment, so mirror it rather than appending.
+      fullTranscript = msg.text || "";
+      partialTranscript = "";
+      renderTranscript();
+    } else if (msg.type === "diagram") {
       mergeGraph(msg.data);
       if (listening) setStatus("listening 🎙️", "ok");
     } else if (msg.type === "empty") {
@@ -798,6 +858,8 @@ function connect() {
         generate_check: "Couldn't generate a check question - try again.",
         generate_quiz: "Couldn't generate the quiz - try again.",
         generate_summary: "Couldn't generate the wrap-up summary - try again.",
+        transcribe: "ElevenLabs transcription dropped - press Stop then Start to reconnect, or use the text box below.",
+        no_key: "No ElevenLabs API key on this machine - paste one in the box at the top.",
       };
       const friendly = messages[msg.context] || `Gemini isn't accessible right now: ${msg.message}`;
       showToast(friendly, "err");
@@ -902,43 +964,63 @@ function connect() {
   ws.onerror = () => setStatus("connection error - retrying...", "err");
 }
 
-function startRecognition() {
-  const recognition = new SpeechRecognition();
-  recognitionInstance = recognition; // so Stop can actually call .stop() on it
-  recognition.continuous = true;
-  recognition.interimResults = false;
-  recognition.lang = "en-US";
+// ---------- ElevenLabs Scribe realtime: mic -> PCM16 16kHz -> our backend
+// websocket -> ElevenLabs. The API key stays server-side, and the browser
+// never has to be Chrome/Edge (no Web Speech API involved). ----------
+async function startElevenLabsCapture() {
+  try {
+    audioStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
+    });
+  } catch (e) {
+    listening = false;
+    startBtn.textContent = "▶ Start listening";
+    startBtn.classList.remove("active");
+    showToast("Mic permission denied - allow microphone access, or use the text box below instead.", "err");
+    return;
+  }
 
-  recognition.onresult = (event) => {
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      if (event.results[i].isFinal) {
-        fullTranscript += " " + event.results[i][0].transcript;
-        transcriptEl.textContent = fullTranscript;
-        transcriptEl.scrollTop = transcriptEl.scrollHeight;
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ text: (fullTranscript + " " + manualInput.value).trim() }));
-        }
-      }
+  // asking the AudioContext for 16kHz directly means no manual resampling:
+  // it's exactly the rate the realtime API expects (pcm_16000).
+  audioContext = new AudioContext({ sampleRate: 16000 });
+  await audioContext.resume();
+  audioSource = audioContext.createMediaStreamSource(audioStream);
+  audioNode = audioContext.createScriptProcessor(4096, 1, 1);
+
+  audioNode.onaudioprocess = (event) => {
+    if (!listening || !wsReady()) return;
+    const input = event.inputBuffer.getChannelData(0);
+    const pcm = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
+    let binary = "";
+    const bytes = new Uint8Array(pcm.buffer);
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    ws.send(JSON.stringify({ type: "audio_chunk", audio_base_64: btoa(binary) }));
   };
 
-  recognition.onerror = (event) => {
-    console.error("SpeechRecognition error:", event.error);
-    if (event.error === "no-speech") return;
-    if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-      showToast("Mic permission denied - allow microphone access, or use the text box below instead.", "err");
-      return;
-    }
-    if (event.error === "network") {
-      showToast("Speech recognition needs network access and failed - use the text box below instead.", "err");
-      return;
-    }
-    showToast(`Mic error: ${event.error} - use the text box below if this persists.`, "err");
-  };
-
-  recognition.onend = () => { if (listening) { try { recognition.start(); } catch (e) {} } };
-  try { recognition.start(); } catch (e) { setStatus("Could not start microphone - use the text box below instead.", "err"); }
+  audioSource.connect(audioNode);
+  // ScriptProcessor only fires while connected to a destination; a zero-gain
+  // node keeps it running without playing the mic back through the speakers.
+  const mute = audioContext.createGain();
+  mute.gain.value = 0;
+  audioNode.connect(mute);
+  mute.connect(audioContext.destination);
+  setStatus("listening 🎙️ (ElevenLabs Scribe)", "ok");
 }
+
+function stopElevenLabsCapture() {
+  if (audioNode) { try { audioNode.disconnect(); } catch (e) {} audioNode = null; }
+  if (audioSource) { try { audioSource.disconnect(); } catch (e) {} audioSource = null; }
+  if (audioContext) { try { audioContext.close(); } catch (e) {} audioContext = null; }
+  if (audioStream) { audioStream.getTracks().forEach((t) => t.stop()); audioStream = null; }
+  partialTranscript = "";
+  renderTranscript();
+  if (wsReady()) ws.send(JSON.stringify({ type: "audio_stop" }));
+}
+
 
 // ---------- pan / zoom (pointer events: mouse + touch + pinch) ----------
 let panX = 0, panY = 0, zoom = 1;

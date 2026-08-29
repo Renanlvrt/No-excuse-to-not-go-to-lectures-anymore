@@ -18,6 +18,13 @@ Open `http://localhost:8010/static/index.html` in **Chrome**.
 Needs a `.env` file (copy `.env.example`, fill in real keys — ask the
 team, never invent placeholder keys and never commit real ones).
 
+## Transcription: ElevenLabs Scribe realtime
+Mic audio is streamed browser → our websocket → ElevenLabs
+`scribe_v2_realtime` (`backend/services/transcribe.py`). Needs
+`ELEVENLABS_API_KEY`. It's the only transcription path (the browser's Web
+Speech API is never used) — on a laptop with no `.env` key the UI shows a
+box to paste one, kept in that browser's localStorage.
+
 ## Current LLM provider: Gemini (temporary)
 `GEMINI_API_KEY` powers concept extraction now. This is a **deliberate
 short-term choice** — the plan is to move off Gemini later (possibly to
