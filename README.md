@@ -123,3 +123,5 @@ self-contained HTML/JS widget (e.g. a Turing machine you can feed input to)
 rendered in a sandboxed `<iframe sandbox="allow-scripts">` (no
 `allow-same-origin`) with a defense-in-depth CSP blocking network egress.
 Researched and scoped (see `SUCCESS_CRITERIA.md` #11) but not yet built.
+
+hey
