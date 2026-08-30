@@ -902,6 +902,14 @@ function connect() {
   ws.onerror = () => setStatus("connection error - retrying...", "err");
 }
 
+function stopListeningDueToMicError(message) {
+  listening = false; // prevents onend from restarting recognition -> loop
+  startBtn.textContent = "▶ Start listening";
+  startBtn.classList.remove("active");
+  if (recognitionInstance) { try { recognitionInstance.stop(); } catch (e) {} }
+  showToast(message, "err");
+}
+
 function startRecognition() {
   const recognition = new SpeechRecognition();
   recognitionInstance = recognition; // so Stop can actually call .stop() on it
@@ -926,11 +934,14 @@ function startRecognition() {
     console.error("SpeechRecognition error:", event.error);
     if (event.error === "no-speech") return;
     if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-      showToast("Mic permission denied - allow microphone access, or use the text box below instead.", "err");
+      stopListeningDueToMicError("Mic permission denied - allow microphone access, or use the text box below instead.");
       return;
     }
     if (event.error === "network") {
-      showToast("Speech recognition needs network access and failed - use the text box below instead.", "err");
+      // Chrome's engine failed to reach its speech server. onend fires right
+      // after this and would otherwise restart -> instant repeat error, so
+      // give up and stop rather than looping toasts forever.
+      stopListeningDueToMicError("Speech recognition needs network access and failed - use the text box below instead.");
       return;
     }
     showToast(`Mic error: ${event.error} - use the text box below if this persists.`, "err");
