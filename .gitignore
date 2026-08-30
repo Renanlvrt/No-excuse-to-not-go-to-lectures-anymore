@@ -4,3 +4,5 @@ __pycache__/
 .env
 .claude/
 data/
+server.out.log
+server.err.log
